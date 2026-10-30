@@ -106,17 +106,64 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     /// The role of the local peer.
     let role: Role
 
+    /// The receive windows the connection advertises, which bound the contiguous bytes a read can
+    /// wait for. Set by the connection.
+    var receiveWindows: ReceiveWindows = .unlimited
+
+    /// The `SwiftNetwork` stack the table's streams run on.
+    struct SwiftNetworkBacking {
+        /// Context for the `SwiftNetwork` stack.
+        let context: NetworkContext
+
+        /// The connection's queued callouts. The table's operations acquire the context through it.
+        let callouts: QUICCallouts
+
+        /// The instance the table's operations enter the stack as.
+        ///
+        /// Registered for the table's lifetime, and retired by ``retireAnchor()``, which must run
+        /// before the table is released: the anchor's event manager traps on deinit otherwise.
+        let anchor: EventContextAnchor
+    }
+
+    /// The `SwiftNetwork` stack, or `nil` if a ``StateMachineQUICConnection`` drives the streams.
+    private let swiftNetwork: SwiftNetworkBacking?
+
+    /// The connection driving the streams through its `StandaloneQUICConnection`, or `nil` if they run on
+    /// the `SwiftNetwork` stack.
+    ///
+    /// Held strongly; ``retireAnchor()`` breaks the cycle with the connection.
+    var stateMachine: StateMachineQUICConnection<Consumer>?
+
+    /// Whether a state machine backed table was closed.
+    private var stateMachineClosed = false
+
     /// Context for the `SwiftNetwork` stack.
-    let context: NetworkContext
+    var context: NetworkContext { self.swiftNetwork!.context }
 
     /// The connection's queued callouts. The table's operations acquire the context through it.
-    let callouts: QUICCallouts
+    var callouts: QUICCallouts { self.swiftNetwork!.callouts }
 
     /// The instance the table's operations enter the stack as.
-    ///
-    /// Registered for the table's lifetime, and retired by ``retireAnchor()``, which must run
-    /// before the table is released: the anchor's event manager traps on deinit otherwise.
-    let anchor: EventContextAnchor
+    var anchor: EventContextAnchor { self.swiftNetwork!.anchor }
+
+    /// Creates a table whose streams a ``StateMachineQUICConnection`` drives.
+    init(role: Role, stateMachine: StateMachineQUICConnection<Consumer>) {
+        self._transportStates = QUICStreamSlots()
+        self._consumerStates = QUICStreamConsumerStates()
+        self._ready = []
+        self._needsState = []
+        self._byID = QUICStreamIDDictionary()
+        self._byFlowIdentifier = [:]
+        self._pendingAttachIdentifier = InstanceIdentifier()
+        self._pendingAttachLinkage = nil
+        self._outputPending = false
+        self.opener = nil
+        self.inReadLoop = false
+        self.outOfBandDrainRequested = false
+        self.role = role
+        self.swiftNetwork = nil
+        self.stateMachine = stateMachine
+    }
 
     /// Creates a table. Must be called with no event context held: it registers the table's anchor.
     init(role: Role, context: NetworkContext, callouts: QUICCallouts) {
@@ -133,9 +180,12 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
         self.inReadLoop = false
         self.outOfBandDrainRequested = false
         self.role = role
-        self.context = context
-        self.callouts = callouts
-        self.anchor = EventContextAnchor(context: context)
+        self.swiftNetwork = SwiftNetworkBacking(
+            context: context,
+            callouts: callouts,
+            anchor: EventContextAnchor(context: context)
+        )
+        self.stateMachine = nil
     }
 
     deinit {
@@ -169,7 +219,10 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
 
     /// Whether the table has closed: its anchor is retired, and it takes no new streams.
     var isClosed: Bool {
-        self.anchor.identifier.isNone
+        if let swiftNetwork = self.swiftNetwork {
+            return swiftNetwork.anchor.identifier.isNone
+        }
+        return self.stateMachineClosed
     }
 }
 
@@ -226,9 +279,12 @@ extension QUICStreamTable where Consumer: ~Copyable {
     @inlinable
     func insertSlot(
         id: QUICStreamID?,
-        state: consuming Consumer.StreamState?
+        state: consuming Consumer.StreamState?,
+        flow: StandaloneStreamFlow? = nil
     ) -> QUICStreamHandle {
-        let transportState = QUICStreamTransportState(core: QUICStreamCore(id: id))
+        var core = QUICStreamCore(id: id)
+        core.flow = flow
+        let transportState = QUICStreamTransportState(core: core)
         let handle = self._transportStates.insert(transportState)
         let consumerStatePointer = self._consumerStates.reserve(at: handle.index)
 
@@ -285,6 +341,11 @@ extension QUICStreamTable where Consumer: ~Copyable {
         transport.pointee.flowIdentifier = linkage.identifier
         assert(self._byFlowIdentifier[linkage.identifier] == nil)  // A flow attaches to at most one stream.
         self._byFlowIdentifier[linkage.identifier] = handle
+    }
+
+    /// Gives a locally opened stream's slot the driver's state for the stream.
+    func attachFlow(_ flow: StandaloneStreamFlow, to handle: QUICStreamHandle) {
+        self._transportStates.withValue(for: handle) { $0.core.flow = flow }
     }
 
     /// Records the ID the stack assigned, indexes it, and connects the stream's state machine.
@@ -410,6 +471,16 @@ extension QUICStreamTable where Consumer: ~Copyable {
     }
 
     /// The peer sent STOP\_SENDING.
+    /// The peer sent STOP\_SENDING to a stream a state machine drives, which answers it itself.
+    func peerStoppedSending(_ handle: QUICStreamHandle, code: QUICApplicationErrorCode) {
+        guard let transport = self._transportStates.pointer(for: handle) else { return }
+
+        transport.pointee.core.receiveStopSendingAnsweredByStack(code: code)
+        transport.pointee.stopSendingCode = code
+
+        self._markReady(handle: handle, transport: transport, events: .stopSending)
+    }
+
     func peerStoppedSending(
         _ handle: QUICStreamHandle,
         code: QUICApplicationErrorCode,
@@ -482,8 +553,13 @@ extension QUICStreamTable where Consumer: ~Copyable {
         }
 
         self.drain(into: &consumer)
-        self.withEventContext { eventContext in
-            self.forceCloseAll(error: disconnect, in: &eventContext)
+        if self.swiftNetwork != nil {
+            self.withEventContext { eventContext in
+                self.forceCloseAll(error: disconnect, in: &eventContext)
+            }
+        } else {
+            // The connection is going away; there is nothing to tell the peer per stream.
+            self.abandonAllLocally()
         }
         self.retireAnchor()
         // Closed first, and with nothing held: the states' deinits are consumer code, and an `open`
@@ -582,8 +658,12 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// state for the stream only once that acquisition has ended: the state's deinit is consumer code.
     func vacateSlot(_ handle: QUICStreamHandle) {
         let state = self.takeConsumerState(for: handle)
-        self.withEventContext { eventContext in
-            self._remove(handle: handle, in: &eventContext)
+        if let stateMachine = self.stateMachine {
+            self._remove(handle: handle, stateMachine: stateMachine)
+        } else {
+            self.withEventContext { eventContext in
+                self._remove(handle: handle, in: &eventContext)
+            }
         }
         // Only now, with nothing held: the state's deinit is consumer code.
         _ = consume state
@@ -616,6 +696,23 @@ extension QUICStreamTable where Consumer: ~Copyable {
         let error = transport.pointee.disconnectError
         transport.pointee.core.close(error: error, in: &eventContext)
         self.unregisterEventManager(of: &transport.pointee, in: &eventContext)
+
+        self._transportStates.removeValue(for: handle)
+        self._consumerStates.removeValue(at: handle.index)
+    }
+
+    /// Closes a slot's stream in the state machine and vacates the slot.
+    private func _remove(handle: QUICStreamHandle, stateMachine: StateMachineQUICConnection<Consumer>) {
+        guard let transport = self._transportStates.pointer(for: handle) else { return }
+
+        if let id = transport.pointee.core.id {
+            let removed = self._byID.removeValue(forID: id)
+            assert(removed == handle)
+            transport.pointee.core.close(on: stateMachine, id: id)
+        } else {
+            stateMachine.cancelPendingOpen(flow: transport.pointee.core.flow)
+            transport.pointee.core.abandonLocally()
+        }
 
         self._transportStates.removeValue(for: handle)
         self._consumerStates.removeValue(at: handle.index)
@@ -692,7 +789,13 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// Retires the table's anchor, after which its operations can't acquire the event context.
     /// Idempotent.
     func retireAnchor() {
-        self.anchor.retire(through: self.callouts)
+        if let swiftNetwork = self.swiftNetwork {
+            swiftNetwork.anchor.retire(through: swiftNetwork.callouts)
+        } else {
+            self.stateMachineClosed = true
+            // Break the cycle with the connection.
+            self.stateMachine = nil
+        }
     }
 }
 
@@ -715,7 +818,16 @@ extension QUICStreamTable where Consumer: ~Copyable {
         minContiguous: Int,
         _ body: (_ span: borrowing RawSpan) -> Int
     ) -> QUICStreamReadOutcome {
-        transport.pointee.core.read(
+        let id = transport.pointee.core.id
+        let minContiguous =
+            id.map {
+                min(minContiguous, self.receiveWindows.largestMinContiguous(for: $0, role: self.role))
+            } ?? minContiguous
+        if let stateMachine = self.stateMachine {
+            guard id != nil else { return .nothingAvailable }
+            return transport.pointee.core.read(minContiguous: minContiguous, from: stateMachine, id: id!, body)
+        }
+        return transport.pointee.core.read(
             minContiguous: minContiguous,
             withEventContext: { pull in self.withEventContext(pull) },
             body
@@ -725,7 +837,10 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// How many bytes the stream `transport` belongs to will accept right now.
     @usableFromInline
     func writableBytes(_ transport: UnsafeMutablePointer<QUICStreamTransportState>) -> Int {
-        self.withEventContext { eventContext in
+        if let stateMachine = self.stateMachine {
+            return transport.pointee.core.writableBytes(on: stateMachine)
+        }
+        return self.withEventContext { eventContext in
             transport.pointee.core.writableBytes(in: &eventContext)
         }
     }
@@ -733,6 +848,10 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// Writes the queued data of the stream `transport` belongs to.
     @usableFromInline
     func flush(_ transport: UnsafeMutablePointer<QUICStreamTransportState>, fin: Bool) throws {
+        if let stateMachine = self.stateMachine {
+            try transport.pointee.core.flush(fin: fin, to: stateMachine)
+            return
+        }
         try self.withEventContext { eventContext in
             try transport.pointee.core.flush(fin: fin, in: &eventContext)
         }
@@ -741,6 +860,10 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// Resets the send side of the stream `transport` belongs to.
     @usableFromInline
     func sendResetStream(_ transport: UnsafeMutablePointer<QUICStreamTransportState>, code: QUICApplicationErrorCode) {
+        if let stateMachine = self.stateMachine {
+            transport.pointee.core.sendResetStream(code: code, on: stateMachine)
+            return
+        }
         self.withEventContext { eventContext in
             transport.pointee.core.sendResetStream(code: code, in: &eventContext)
         }
@@ -749,6 +872,10 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// Closes the receive side of the stream `transport` belongs to.
     @usableFromInline
     func sendStopSending(_ transport: UnsafeMutablePointer<QUICStreamTransportState>, code: QUICApplicationErrorCode) {
+        if let stateMachine = self.stateMachine {
+            transport.pointee.core.sendStopSending(code: code, on: stateMachine)
+            return
+        }
         self.withEventContext { eventContext in
             transport.pointee.core.sendStopSending(code: code, in: &eventContext)
         }
@@ -762,4 +889,57 @@ private struct SlotRegistration: ProtocolInstance, ~Copyable {
     let context: NetworkContext
     var identifier: InstanceIdentifier
     var eventManager: ProtocolEventManager
+}
+
+/// The flow control windows a connection advertises for what it receives (RFC 9000 Section 4).
+@available(anyAppleOS 26, *)
+struct ReceiveWindows {
+    /// The window of a bidirectional stream the local peer opened.
+    var bidirectionalLocal: Int
+    /// The window of a bidirectional stream the remote peer opened.
+    var bidirectionalRemote: Int
+    /// The window of a unidirectional stream the remote peer opened.
+    var unidirectional: Int
+    /// The window of the whole connection.
+    var connection: Int
+
+    /// No bound.
+    static var unlimited: Self {
+        Self(bidirectionalLocal: .max, bidirectionalRemote: .max, unidirectional: .max, connection: .max)
+    }
+
+    init(bidirectionalLocal: Int, bidirectionalRemote: Int, unidirectional: Int, connection: Int) {
+        self.bidirectionalLocal = bidirectionalLocal
+        self.bidirectionalRemote = bidirectionalRemote
+        self.unidirectional = unidirectional
+        self.connection = connection
+    }
+
+    init(_ configuration: QUICConfiguration) {
+        self.init(
+            bidirectionalLocal: configuration.initialMaxStreamDataBidiLocal,
+            bidirectionalRemote: configuration.initialMaxStreamDataBidiRemote,
+            unidirectional: configuration.initialMaxStreamDataUni,
+            connection: configuration.initialMaxData
+        )
+    }
+
+    /// The most contiguous bytes a read on the stream `id` can wait for.
+    ///
+    /// The peer can't send past a window, and the window only moves once the application consumes
+    /// half of it (RFC 9000 Section 4.2). A read that waits for more than half the window may never
+    /// see it arrive; half of the smaller of the stream's and the connection's windows always can.
+    func largestMinContiguous(for id: QUICStreamID, role: Role) -> Int {
+        let stream: Int
+        switch (QUICStreamType(id), role) {
+        case (.clientInitiatedBidirectional, .client), (.serverInitiatedBidirectional, .server):
+            stream = self.bidirectionalLocal
+        case (.clientInitiatedBidirectional, .server), (.serverInitiatedBidirectional, .client):
+            stream = self.bidirectionalRemote
+        case (.clientInitiatedUnidirectional, _), (.serverInitiatedUnidirectional, _):
+            // The local peer never reads from a stream it opened unidirectionally.
+            stream = self.unidirectional
+        }
+        return max(min(stream, self.connection) / 2, 1)
+    }
 }

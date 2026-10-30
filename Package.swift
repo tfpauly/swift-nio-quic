@@ -39,6 +39,7 @@ let swiftSettings: [SwiftSetting] =
 
 let package = Package(
     name: "swift-nio-quic",
+    platforms: [.macOS("26.0")],
     products: [
         .library(name: "NIOQUIC", targets: ["NIOQUIC"])
     ],
@@ -50,11 +51,11 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-crypto.git", from: "5.0.0"),
         .package(url: "https://github.com/apple/swift-nio-quic-helpers.git", .upToNextMinor(from: "0.1.1")),
         .package(
-            url: "https://github.com/apple/swift-network-evolution",
-            .upToNextMinor(from: "0.5.0"),
+            url: "https://github.com/apple/swift-network-evolution.git",
+            revision: "538b8b0c7dc61b1ab9f099939bd567873a4a3013",
             traits: swiftNetworkTraits
         ),
-        .package(url: "https://github.com/apple/swift-tls", .upToNextMinor(from: "0.1.0")),
+        .package(url: "https://github.com/apple/swift-tls", .upToNextMinor(from: "0.2.0")),
     ],
     targets: [
         .executableTarget(

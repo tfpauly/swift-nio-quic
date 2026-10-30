@@ -63,6 +63,29 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
     /// The underlying SwiftNetwork-backed QUIC connection.
     private let _connection: Connection
 
+    /// The implementation that drives the connection. Safe from any thread: `_connection` is immutable.
+    var driver: QUICConnectionDriver? {
+        self._connection.driver
+    }
+
+    #if DEBUG
+    /// The state machine connection behind the channel, if it has one.
+    var _forTesting_stateMachineConnection: StateMachineQUICConnection<Consumer>? {
+        guard case .stateMachine(let connection) = self._connection else { return nil }
+        return connection
+    }
+
+    /// Closes the connection behind the channel, as when the connection starts closing on its own
+    /// (for example on the peer's CONNECTION\_CLOSE): the channel and its streams learn about it
+    /// on the next drain, not now.
+    func _forTesting_closeConnectionOnly() {
+        self.eventLoop.assertInEventLoop()
+        self.withoutEnteringDrainOutput {
+            _ = self._connection.close(isApplicationClose: true, errorCode: 0, reason: "")
+        }
+    }
+    #endif
+
     /// A registrar for connection IDs.
     private let _registrar: ConnectionIDRegistrar
 
@@ -169,6 +192,8 @@ final class QUICConnectionChannel<Consumer: QUICStreamConsumer & ~Copyable>: @un
 
         switch connection {
         case .live(let connection):
+            connection.setDriver(self)
+        case .stateMachine(let connection):
             connection.setDriver(self)
         case .test:
             ()
@@ -535,6 +560,14 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
 
     var transportView: TransportView {
         TransportView(self)
+    }
+}
+
+@available(anyAppleOS 26, *)
+extension QUICConnectionChannel.TransportView where Consumer: ~Copyable {
+    /// The address of the connection's peer.
+    var remoteAddress: SocketAddress? {
+        self.channel.remoteAddress
     }
 }
 
@@ -1007,7 +1040,14 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
         }
 
         // Done producing data: exit read loop (which also flushes outbound data.)
-        self._connection.withLiveOnly { $0.exitReadLoop() }
+        switch self._connection {
+        case .live(let connection):
+            connection.exitReadLoop()
+        case .stateMachine(let connection):
+            connection.exitReadLoop()
+        case .test:
+            ()
+        }
         // Stream initializers may produce output; reconcile any pending events again.
         self.drainAndReconcileLifecycle()
     }
@@ -1069,7 +1109,8 @@ extension QUICConnectionChannel where Consumer: ~Copyable {
                 promise.fail(error)
             }
 
-        case .test:
+        case .stateMachine, .test:
+            // A state machine driven connection serves streams through its stream table only.
             promise.fail(ChannelError.operationUnsupported)
         }
 

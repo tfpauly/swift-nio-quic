@@ -39,6 +39,11 @@ public struct QUICStreamConnection<Consumer: QUICStreamConsumer & ~Copyable>: @u
         self._channel = channel
     }
 
+    /// The implementation that drives the connection.
+    var driver: QUICConnectionDriver? {
+        self._channel.driver
+    }
+
     /// Runs `body` on the connection's streams.
     ///
     /// Streams stay reachable once the connection has closed, but no more can be opened.

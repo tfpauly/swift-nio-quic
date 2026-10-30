@@ -224,6 +224,21 @@ enum QUICCallout {
     }
 }
 
+@available(anyAppleOS 26, *)
+extension QUICCallout {
+    /// The keep-alive interval in the whole seconds ``setKeepalive(_:seconds:)`` takes.
+    ///
+    /// SwiftNetwork reads `0` as "off" and `UInt16.max` as "its default interval", so an interval
+    /// rounds down to whole seconds, but to at least one second and below `UInt16.max`: a
+    /// sub-second interval must not turn keep-alives off.
+    static func keepAliveSeconds(for interval: Duration) -> UInt16 {
+        guard interval > .zero else {
+            return 0
+        }
+        return UInt16(clamping: min(max(interval.components.seconds, 1), Int64(UInt16.max) - 1))
+    }
+}
+
 /// A call into the connection channel. See ``QUICCallout/connection(_:_:)``.
 @available(anyAppleOS 26, *)
 enum QUICConnectionCallout {

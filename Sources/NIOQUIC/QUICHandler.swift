@@ -16,6 +16,16 @@ import Logging
 import NIOCore
 import X509
 
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#elseif canImport(Android)
+import Android
+#endif
+
 @available(anyAppleOS 26, *)
 private enum MultiplexerContinuation<Consumer: QUICStreamConsumer & ~Copyable> {
     case connectionMultiplexerContinuation(
@@ -87,6 +97,10 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
 
     /// A registry of connections.
     private var connectionRegistry: ConnectionRegistry<QUICConnectionChannel<Consumer>.TransportView>
+    /// State machine connections whose channel closed while their connection still closes or drains
+    /// (RFC 9000 Section 10.2), under the routes they had. They answer their peer's packets until
+    /// the connection is closed.
+    private var closingConnections: ConnectionRegistry<StateMachineQUICConnection<Consumer>>
     /// Decides whether new connections may be admitted.
     private var connectionAdmissionController: ConnectionAdmissionController
 
@@ -122,6 +136,9 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
     private var authenticator: Authenticator?
     /// Makes a consumer for a given connection, `nil` if stream channels are used.
     private let makeConsumer: ((QUICStreamConnection<Consumer>) -> Consumer)?
+    /// The implementation that drives new consumer connections. Set it before the first
+    /// connection is created.
+    var connectionDriver: QUICConnectionDriver
 
     private func nextConnectionHandle() -> ConnectionHandle {
         let handle = self.connectionHandle
@@ -164,7 +181,9 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
         self.authenticator = authenticator
         self.connectionHandle = .initial
         self.connectionRegistry = ConnectionRegistry()
+        self.closingConnections = ConnectionRegistry()
         self.makeConsumer = makeConsumer
+        self.connectionDriver = .default(for: quicConfiguration.role)
         self.connectionAdmissionController = makeConnectionAdmissionController(
             for: connectionLimits,
             logger: logger,
@@ -248,25 +267,43 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
                 logger[metadataKey: LoggingKeys.addressRemote] = "\(remoteAddress)"
                 return logger
             }()
-            // The context is set when the channel becomes active so force unwrapping is okay here
-            let quicConnection = try SwiftNetworkQUICConnection<Consumer>.client(
-                configuration: self.quicConfiguration,
-                sourceConnectionID: sourceConnectionID,
-                statelessResetTokenGenerator: self.statelessResetTokenGenerator,
-                serverName: serverName,
-                asyncVerifier: asyncVerifierRunner?.asyncVerifier,
-                localAddress: localAddress,
-                remoteAddress: remoteAddress,
-                eventLoop: self.context!.eventLoop,
-                logger: connectionLogger,
-                usesStreamTable: self.makeConsumer != nil
-            )
-
             let handle = self.nextConnectionHandle()
-            let channel = self.makeQUICConnectionChannel(
-                quicConnection: quicConnection,
-                handle: handle
-            )
+            let channel: QUICConnectionChannel<Consumer>
+            var stateMachineConnection: StateMachineQUICConnection<Consumer>?
+            if self.makeConsumer != nil && self.connectionDriver == .stateMachine
+                && QUICConnectionDriver.stateMachineSupports(self.quicConfiguration)
+            {
+                let connection = try StateMachineQUICConnection<Consumer>.client(
+                    configuration: self.quicConfiguration,
+                    sourceConnectionID: sourceConnectionID,
+                    serverName: serverName,
+                    asyncVerifier: asyncVerifierRunner?.asyncVerifier,
+                    localAddress: localAddress,
+                    remoteAddress: remoteAddress,
+                    eventLoop: self.context!.eventLoop,
+                    logger: connectionLogger
+                )
+                channel = self.makeQUICConnectionChannel(stateMachineConnection: connection, handle: handle)
+                stateMachineConnection = connection
+            } else {
+                // The context is set when the channel becomes active so force unwrapping is okay here
+                let quicConnection = try SwiftNetworkQUICConnection<Consumer>.client(
+                    configuration: self.quicConfiguration,
+                    sourceConnectionID: sourceConnectionID,
+                    statelessResetTokenGenerator: self.statelessResetTokenGenerator,
+                    serverName: serverName,
+                    asyncVerifier: asyncVerifierRunner?.asyncVerifier,
+                    localAddress: localAddress,
+                    remoteAddress: remoteAddress,
+                    eventLoop: self.context!.eventLoop,
+                    logger: connectionLogger,
+                    usesStreamTable: self.makeConsumer != nil
+                )
+                channel = self.makeQUICConnectionChannel(
+                    quicConnection: quicConnection,
+                    handle: handle
+                )
+            }
             let view = channel.transportView
             self.connectionRegistry.insert(view, forHandle: handle, connectionID: sourceConnectionID)
 
@@ -289,7 +326,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
                 }
 
             channel.closeFuture.assumeIsolated().whenComplete { _ in
-                self.connectionDidClose(handle)
+                self.connectionDidClose(handle, stateMachineConnection: stateMachineConnection)
             }
 
         case .shuttingDown:
@@ -341,9 +378,57 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
         self.connectionsAwaitingReadComplete.removeAll(keepingCapacity: true)
     }
 
-    private func connectionDidClose(_ handle: ConnectionHandle) {
+    private func connectionDidClose(
+        _ handle: ConnectionHandle,
+        stateMachineConnection: StateMachineQUICConnection<Consumer>?
+    ) {
         self.eventLoop.assertInEventLoop()
+        let connectionIDs = self.connectionRegistry.connectionIDs(for: handle)
         self.connectionRegistry.remove(handle)
+
+        // A state machine connection outlives its channel while it closes or drains
+        // (RFC 9000 Section 10.2): keep routing the peer's packets to it, so that it answers them
+        // with CONNECTION_CLOSE, until the connection is closed. Not once the UDP channel is gone.
+        guard let connection = stateMachineConnection, connection.isClosingWithoutChannel,
+            let firstConnectionID = connectionIDs.first, self.context?.channel.isActive == true
+        else { return }
+        self.closingConnections.insert(connection, forHandle: handle, connectionID: firstConnectionID)
+        for connectionID in connectionIDs.dropFirst() {
+            self.closingConnections.associate(connectionID, with: handle)
+        }
+        // The cycle through the handler is broken when the connection is closed, or in
+        // `abandonClosingConnections()`.
+        connection.continueClosing(transport: ChildView(self)) {
+            self.closingConnections.remove(handle)
+        }
+    }
+
+    /// Stops driving the connections that close without a channel: the UDP channel is gone.
+    private func abandonClosingConnections() {
+        for connection in self.closingConnections.values {
+            connection.abandonClosing()
+        }
+        self.closingConnections = ConnectionRegistry()
+    }
+
+    /// Hands a short-header packet that routes to no connection to the connections with its sender.
+    ///
+    /// A stateless reset carries no connection ID of ours: only a connection can recognize it, by
+    /// the token it ends in (RFC 9000 Section 10.3.1). A client has few connections, so it hands
+    /// such a packet to each one with the sender as its peer.
+    ///
+    /// - Returns: Whether a connection got the packet.
+    private func deliverPossibleStatelessReset(_ envelope: AddressedEnvelope<ByteBuffer>) -> Bool {
+        // The shortest stateless reset: a header byte, four unpredictable bytes and the token
+        // (RFC 9000 Section 10.3).
+        guard envelope.data.readableBytes >= 21 else { return false }
+
+        var delivered = false
+        for view in self.connectionRegistry.values where view.remoteAddress == envelope.remoteAddress {
+            self.deliverPacket(envelope, to: view)
+            delivered = true
+        }
+        return delivered
     }
 
     /// Answers a packet which routes to no connection with a stateless reset (RFC 9000 § 10.3),
@@ -394,6 +479,47 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
 
         self.writeDatagram(
             AddressedEnvelope(remoteAddress: envelope.remoteAddress, data: reset),
+            promise: nil
+        )
+    }
+
+    /// Answers a long header packet in a version this endpoint doesn't support with a Version
+    /// Negotiation packet (RFC 9000 Section 6.1).
+    private func trySendVersionNegotiation(
+        for header: QUICPacketHeader,
+        triggeredBy envelope: AddressedEnvelope<ByteBuffer>
+    ) {
+        self.eventLoop.assertInEventLoop()
+
+        // RFC 9000 Section 6.1: "An endpoint MUST NOT send a Version Negotiation packet in
+        // response to receiving a Version Negotiation packet."
+        guard header.version != .negotiation else {
+            return
+        }
+        // RFC 9000 Section 5.2.2: a server answers a packet only "if the packet is large enough
+        // to initiate a new connection for any supported version", and "Servers MUST drop smaller
+        // packets that specify unsupported versions". A version 1 Initial fills a datagram of at
+        // least 1200 bytes (RFC 9000 Section 14.1). This also keeps the answer smaller than the
+        // packet, so it doesn't amplify.
+        guard envelope.data.readableBytes >= 1200 else {
+            return
+        }
+        guard let versionNegotiation = header.versionNegotiationPacket(allocator: self.udpChannel.allocator) else {
+            return
+        }
+
+        self.logger.debug(
+            "QUICHandler sending version negotiation",
+            metadata: [
+                LoggingKeys.addressRemote: "\(envelope.remoteAddress)",
+                LoggingKeys.packetVersion: "\(String(describing: header.version))",
+                LoggingKeys.connectionDCID: "\(header.destinationConnectionID.description)",
+                LoggingKeys.channelOutboundBytes: "\(versionNegotiation.readableBytes)",
+            ]
+        )
+
+        self.writeDatagram(
+            AddressedEnvelope(remoteAddress: envelope.remoteAddress, data: versionNegotiation),
             promise: nil
         )
     }
@@ -719,6 +845,7 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
         self.logger.trace("QUICHandler removed from channel pipeline")
         self.context = nil
         self.connectionRegistry.shutdownConnections(deadline: .now(), promise: nil)
+        self.abandonClosingConnections()
     }
 
     public func channelInactive(context: ChannelHandlerContext) {
@@ -726,6 +853,7 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
         asyncVerifierRunner?.terminate()
 
         self.connectionRegistry.notifyParentChannelInactive()
+        self.abandonClosingConnections()
 
         switch self.multiplexerContinuation {
         case .none:
@@ -796,11 +924,16 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
             case .accepting:
                 if let view = self.connectionRegistry[header.destinationConnectionID] {
                     self.deliverPacket(addressedEnvelope, to: view)
+                } else if let connection = self.closingConnections[header.destinationConnectionID] {
+                    connection.receiveWhileClosing(addressedEnvelope)
                 } else if self.quicConfiguration.role == .server {
-                    // Only INITIAL packets can create new connections. However, we do need to
-                    // pass packets with unknown versions to Swift QUIC to initiate version
-                    // negotation.
-                    if header.type == .initial || header.type == .versionNegotiation {
+                    if header.type != .short, header.version != .v1 {
+                        // A long header in a version we don't speak starts no connection. Version
+                        // Negotiation is stateless, so the handler answers it for every driver
+                        // (RFC 9000 Section 5.2.2).
+                        self.trySendVersionNegotiation(for: header, triggeredBy: addressedEnvelope)
+                    } else if header.type == .initial {
+                        // Only INITIAL packets can create new connections.
                         switch self.connectionAdmissionController.acceptNewConnection() {
                         case .accept:
                             try self.acceptNewConnection(
@@ -836,6 +969,9 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
                         )
                         self.trySendStatelessReset(for: header, triggeredBy: addressedEnvelope)
                     }
+                } else if header.type == .short, self.deliverPossibleStatelessReset(addressedEnvelope) {
+                    // A client connection to the sender may recognize it as a stateless reset.
+                    ()
                 } else {
                     self.logger.warning(
                         "QUICHandler dropping packet",
@@ -849,6 +985,10 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
                 }
             case .shuttingDown:
                 // We still need to forward packets to open connections but not accept new ones.
+                if let connection = self.closingConnections[header.destinationConnectionID] {
+                    connection.receiveWhileClosing(addressedEnvelope)
+                    break
+                }
                 guard let view = self.connectionRegistry[header.destinationConnectionID] else {
                     self.logger.warning(
                         "QUICHandler dropping packet since the server is shutting down and not accepting new connections",
@@ -957,20 +1097,41 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
         configuration.initialPacketSize = .fixed(
             configuration.initialPacketSize.size(forClientInitial: addressedEnvelope.data.readableBytes)
         )
-        let quicConnection: SwiftNetworkQUICConnection<Consumer>
+        let quicConnection: AcceptedConnection
         do {
-            // The context is set when the channel becomes active so force unwrapping is okay here
-            quicConnection = try SwiftNetworkQUICConnection<Consumer>.server(
-                configuration: configuration,
-                sourceConnectionID: newSourceConnectionID,
-                statelessResetTokenGenerator: self.statelessResetTokenGenerator,
-                authenticator: self.authenticator,
-                localAddress: localAddress,
-                remoteAddress: addressedEnvelope.remoteAddress,
-                logger: connectionLogger,
-                eventLoop: self.context!.eventLoop,
-                usesStreamTable: self.makeConsumer != nil
-            )
+            if self.makeConsumer != nil && self.connectionDriver == .stateMachine
+                && QUICConnectionDriver.stateMachineSupports(configuration)
+            {
+                quicConnection = .stateMachine(
+                    try StateMachineQUICConnection<Consumer>.server(
+                        configuration: configuration,
+                        sourceConnectionID: newSourceConnectionID,
+                        originalDestinationConnectionID: destinationConnectionID,
+                        peerConnectionID: sourceConnectionID,
+                        statelessResetTokenGenerator: self.statelessResetTokenGenerator,
+                        authenticator: self.authenticator,
+                        localAddress: localAddress,
+                        remoteAddress: addressedEnvelope.remoteAddress,
+                        eventLoop: self.context!.eventLoop,
+                        logger: connectionLogger
+                    )
+                )
+            } else {
+                // The context is set when the channel becomes active so force unwrapping is okay here
+                quicConnection = .swiftNetwork(
+                    try SwiftNetworkQUICConnection<Consumer>.server(
+                        configuration: configuration,
+                        sourceConnectionID: newSourceConnectionID,
+                        statelessResetTokenGenerator: self.statelessResetTokenGenerator,
+                        authenticator: self.authenticator,
+                        localAddress: localAddress,
+                        remoteAddress: addressedEnvelope.remoteAddress,
+                        logger: connectionLogger,
+                        eventLoop: self.context!.eventLoop,
+                        usesStreamTable: self.makeConsumer != nil
+                    )
+                )
+            }
         } catch {
             // Admission already counted this connection, but its release callbacks are only
             // registered once it exists. Give the slots back here.
@@ -1097,9 +1258,15 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
             self.connectionAdmissionController.finishedHandshake()
         }
 
+        let stateMachineConnection: StateMachineQUICConnection<Consumer>?
+        if case .stateMachine(let connection) = quicConnection {
+            stateMachineConnection = connection
+        } else {
+            stateMachineConnection = nil
+        }
         channel.closeFuture.assumeIsolated().whenComplete { _ in
             self.connectionAdmissionController.closingConnection()
-            self.connectionDidClose(handle)
+            self.connectionDidClose(handle, stateMachineConnection: stateMachineConnection)
         }
     }
 }
@@ -1236,6 +1403,46 @@ extension QUICHandler.RegistrarView: Sendable where Consumer: ~Copyable {}
 
 @available(anyAppleOS 26, *)
 extension QUICHandler where Consumer: ~Copyable {
+    /// A connection accepted from a client's Initial, before its channel exists.
+    enum AcceptedConnection {
+        case swiftNetwork(SwiftNetworkQUICConnection<Consumer>)
+        case stateMachine(StateMachineQUICConnection<Consumer>)
+    }
+
+    private func makeQUICConnectionChannel(
+        quicConnection: AcceptedConnection,
+        handle: ConnectionHandle
+    ) -> QUICConnectionChannel<Consumer> {
+        switch quicConnection {
+        case .swiftNetwork(let connection):
+            return self.makeQUICConnectionChannel(quicConnection: connection, handle: handle)
+        case .stateMachine(let connection):
+            return self.makeQUICConnectionChannel(stateMachineConnection: connection, handle: handle)
+        }
+    }
+
+    private func makeQUICConnectionChannel(
+        stateMachineConnection connection: StateMachineQUICConnection<Consumer>,
+        handle: ConnectionHandle
+    ) -> QUICConnectionChannel<Consumer> {
+        let table = connection.streamTable
+
+        let channel = QUICConnectionChannel(
+            udpChannel: self.udpChannel,
+            connection: .stateMachine(connection),
+            registrar: .live(QUICHandler<Consumer>.RegistrarView(self, handle: handle)),
+            transport: .live(QUICHandler<Consumer>.ChildView(self)),
+            isServer: connection.role == .server,
+            table: table
+        )
+
+        if table != nil, let makeConsumer = self.makeConsumer {
+            channel.setConsumer(makeConsumer(QUICStreamConnection(channel: channel)))
+        }
+
+        return channel
+    }
+
     private func makeQUICConnectionChannel(
         quicConnection: SwiftNetworkQUICConnection<Consumer>,
         handle: ConnectionHandle
@@ -1326,4 +1533,65 @@ private func makeConnectionAdmissionController(
             eventLoop: eventLoop
         )
     }
+}
+
+/// The implementation that drives a connection.
+@available(anyAppleOS 26, *)
+enum QUICConnectionDriver: Hashable, Sendable {
+    /// The SwiftNetwork framework's `QUICConnection`.
+    case swiftNetwork
+    /// SwiftNetwork's `StandaloneQUICConnection`, driven directly. Only connections that serve a stream
+    /// consumer, with a configuration it ``stateMachineSupports(_:)``, can use it; the others fall back to
+    /// ``swiftNetwork``.
+    case stateMachine
+
+    /// The default for a role: ``stateMachine``, unless the `NIOQUIC_DRIVER` environment variable
+    /// says otherwise. `swift-network` selects ``swiftNetwork`` for both roles,
+    /// `state-machine-server` and `state-machine-client` keep the state machine for one role only.
+    static func `default`(for role: Role) -> Self {
+        switch Self.setting {
+        case "swift-network":
+            return .swiftNetwork
+        case "state-machine-server":
+            return role == .server ? .stateMachine : .swiftNetwork
+        case "state-machine-client":
+            return role == .client ? .stateMachine : .swiftNetwork
+        default:
+            return .stateMachine
+        }
+    }
+
+    /// The ``QUICConfiguration`` properties the state machine driver implements, whatever their
+    /// value. A configuration that sets any other property to something but its default falls back
+    /// to ``swiftNetwork``, see ``stateMachineSupports(_:)``.
+    static let stateMachineProperties: Set<String> = [
+        "role",
+        // TLS: the drivers make the same `SwiftTLSProtocol.Options`.
+        "keyExchangeGroup", "applicationProtocols", "serverName", "authenticationConfiguration",
+        "peerCertificateVerification", "verificationConfiguration",
+        // Transport parameters and the connection's own settings.
+        "initialMaxData", "initialMaxStreamDataBidiLocal", "initialMaxStreamDataBidiRemote",
+        "initialMaxStreamDataUni", "initialMaxStreamsBidi", "initialMaxStreamsUni", "maxIdleTimeout",
+        "keepAliveInterval", "maxDatagramFrameSize", "initialPacketSize", "forceVersionNegotiation",
+    ]
+
+    /// The ``QUICConfiguration`` properties the state machine driver implements only at their
+    /// defaults: it sends no Retry, and writes no key log or qlog. ``stateMachineSupports(_:)``
+    /// checks each.
+    ///
+    /// Together with ``stateMachineProperties`` these are all of the configuration's properties;
+    /// a test checks that a new one is added to either.
+    static let stateMachineDefaultOnlyProperties: Set<String> = ["keyLogPath", "qLogConfiguration", "sendRetry"]
+
+    /// Whether the state machine driver implements everything `configuration` asks for: the
+    /// ``stateMachineProperties`` at any value, and the ``stateMachineDefaultOnlyProperties`` at
+    /// their defaults.
+    static func stateMachineSupports(_ configuration: QUICConfiguration) -> Bool {
+        configuration.keyLogPath == nil && configuration.qLogConfiguration == nil && !configuration.sendRetry
+    }
+
+    private static let setting: String? = {
+        guard let value = getenv("NIOQUIC_DRIVER") else { return nil }
+        return String(cString: value)
+    }()
 }

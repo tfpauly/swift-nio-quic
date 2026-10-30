@@ -75,7 +75,7 @@ final class SendableAddress: Sendable {
         self.address = Mutex(address)
     }
 
-    fileprivate(set) var value: SocketAddress {
+    var value: SocketAddress {
         get {
             self.address.withLock { $0 }
         }
@@ -521,6 +521,7 @@ final class SwiftNetworkQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 context: swiftNetworkParameters.context,
                 callouts: self.callouts
             )
+            table.receiveWindows = ReceiveWindows(configuration)
 
             // The same references an outbound child-channel stream attaches in
             // 'addNewOutboundStreamInputHandler'.
@@ -1458,6 +1459,19 @@ extension SwiftNetworkQUICConnection where Consumer: ~Copyable {
             )
             // Do not complete the handshake or announce connection IDs again.
             return
+        }
+
+        // A connection using a stream table has no stream handler that sets the keep-alive
+        // interval once it connects, so the flow handler carries it (see `init`).
+        if self.streamTable != nil, let newFlowHandler = self.connectionNewFlowHandler,
+            let keepAliveInterval = newFlowHandler.keepAliveInterval.take(),
+            let connectionMetadata = newFlowHandler.getConnectionMetadata(in: &eventContext)?.connectionMetadata
+        {
+            // The setter acquires the event context itself, so it runs once the context is released.
+            self.callouts.add(
+                .setKeepalive(connectionMetadata, seconds: QUICCallout.keepAliveSeconds(for: keepAliveInterval)),
+                in: &eventContext
+            )
         }
 
         // Generate additional CIDs for the peer after handshake completes.

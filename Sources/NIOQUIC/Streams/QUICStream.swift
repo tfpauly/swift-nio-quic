@@ -82,7 +82,13 @@ extension QUICStream where Consumer: ~Copyable {
     /// - Parameters:
     ///   - minContiguousBytes: The shortest run of contiguous bytes to hand to `body`. Data is
     ///     coalesced to reach it (which may incur additional copies and allocations); `1` never
-    ///     coalesces (and therefore does not incur additional copies and allocations).
+    ///     coalesces (and therefore does not incur additional copies and allocations). Shorter runs
+    ///     are handed over at the end of the stream. The peer can't send past the flow control
+    ///     window until bytes are consumed, so a value above half the smaller of the stream's and
+    ///     the connection's receive windows (``QUICConfiguration/initialMaxStreamDataBidiLocal``,
+    ///     ``QUICConfiguration/initialMaxStreamDataBidiRemote``,
+    ///     ``QUICConfiguration/initialMaxStreamDataUni`` and ``QUICConfiguration/initialMaxData``)
+    ///     is lowered to that half.
     ///   - body: Called with a chunk of contiguous bytes, returning how many of them it consumed.
     ///     May be called multiple times.
     /// - Returns: What was handed over, and whether the peer's data is now exhausted.

@@ -61,6 +61,12 @@ struct ConnectionRegistry<Value> {
         }
     }
 
+    /// The connection IDs that route to the connection identified by `handle`, or none if
+    /// `handle` is unknown.
+    func connectionIDs(for handle: ConnectionHandle) -> [QUICConnectionID] {
+        self.connectionIDs[handle] ?? []
+    }
+
     /// Adds a connection, routable by `connectionID`.
     ///
     /// - Parameters:

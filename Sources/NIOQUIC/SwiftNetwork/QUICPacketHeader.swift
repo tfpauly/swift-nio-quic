@@ -145,8 +145,8 @@ struct QUICPacketHeader: Hashable, Sendable {
                 }
 
             default:
-                // We pass other cases as a version negotiation request to SwiftQUIC and let it decide
-                // how to handle them. This includes:
+                // Other versions are unsupported, and a server answers them with Version
+                // Negotiation (see `QUICHandler`). This includes:
                 // * Forced version negotiation (RFC 9000, Section 15): "Versions that follow the pattern
                 //   0x?a?a?a?a are reserved for use in forcing version negotiation to be exercised -- that
                 //   is, any version number where the low four bits of all bytes is 1010 (in binary)."
@@ -242,5 +242,32 @@ extension NIOCore.ByteBuffer {
                 token: header.token
             )
         }
+    }
+}
+
+@available(anyAppleOS 26, *)
+extension QUICPacketHeader {
+    /// The Version Negotiation packet (RFC 9000 Section 17.2.1) that answers this packet. It lists
+    /// the versions SwiftNetwork's connections speak, and swaps the packet's connection IDs, as
+    /// RFC 9000 Section 6.1 requires.
+    ///
+    /// - Parameter allocator: The allocator for the returned buffer.
+    /// - Returns: The datagram, or `nil` if the packet has no source connection ID.
+    func versionNegotiationPacket(allocator: ByteBufferAllocator) -> ByteBuffer? {
+        guard let sourceConnectionID = self.sourceConnectionID else {
+            return nil
+        }
+        // The utility swaps the IDs: the packet's source ID becomes the answer's destination ID.
+        let bytes = try? QUICConnectionUtilities.createVersionNegotiationPacket(
+            destinationConnectionID: SwiftNetwork.QUICConnectionID(self.destinationConnectionID),
+            sourceConnectionID: SwiftNetwork.QUICConnectionID(sourceConnectionID)
+        )
+        guard let bytes else {
+            return nil
+        }
+
+        var buffer = allocator.buffer(capacity: bytes.count)
+        buffer.writeBytes(bytes)
+        return buffer
     }
 }

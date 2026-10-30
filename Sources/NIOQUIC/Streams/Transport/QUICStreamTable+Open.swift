@@ -37,6 +37,13 @@ extension QUICStreamTable where Consumer: ~Copyable {
         }
 
         if self.isClosed { throw QUICError.invalidStreamState }
+
+        if let stateMachine = self.stateMachine {
+            let handle = self.insertSlot(id: nil, state: consume state)
+            stateMachine.openStream(for: handle, bidirectional: !type.isUnidirectional)
+            return handle
+        }
+
         guard let opener = self.opener else { throw QUICError.invalidStreamState }
 
         let handle = self.insertSlot(id: nil, state: consume state)
