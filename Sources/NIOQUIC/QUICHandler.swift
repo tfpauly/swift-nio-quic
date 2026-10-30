@@ -97,9 +97,9 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
 
     /// A registry of connections.
     private var connectionRegistry: ConnectionRegistry<QUICConnectionChannel<Consumer>.TransportView>
-    /// State machine connections whose channel closed while their core still closes or drains
+    /// State machine connections whose channel closed while their connection still closes or drains
     /// (RFC 9000 Section 10.2), under the routes they had. They answer their peer's packets until
-    /// the core is closed.
+    /// the connection is closed.
     private var closingConnections: ConnectionRegistry<StateMachineQUICConnection<Consumer>>
     /// Decides whether new connections may be admitted.
     private var connectionAdmissionController: ConnectionAdmissionController
@@ -386,9 +386,9 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
         let connectionIDs = self.connectionRegistry.connectionIDs(for: handle)
         self.connectionRegistry.remove(handle)
 
-        // A state machine connection's core outlives its channel while it closes or drains
+        // A state machine connection outlives its channel while it closes or drains
         // (RFC 9000 Section 10.2): keep routing the peer's packets to it, so that it answers them
-        // with CONNECTION_CLOSE, until the core is closed. Not once the UDP channel is gone.
+        // with CONNECTION_CLOSE, until the connection is closed. Not once the UDP channel is gone.
         guard let connection = stateMachineConnection, connection.isClosingWithoutChannel,
             let firstConnectionID = connectionIDs.first, self.context?.channel.isActive == true
         else { return }
@@ -396,7 +396,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
         for connectionID in connectionIDs.dropFirst() {
             self.closingConnections.associate(connectionID, with: handle)
         }
-        // The cycle through the handler is broken when the core is closed, or in
+        // The cycle through the handler is broken when the connection is closed, or in
         // `abandonClosingConnections()`.
         connection.continueClosing(transport: ChildView(self)) {
             self.closingConnections.remove(handle)
@@ -1540,7 +1540,7 @@ private func makeConnectionAdmissionController(
 enum QUICConnectionDriver: Hashable, Sendable {
     /// The SwiftNetwork framework's `QUICConnection`.
     case swiftNetwork
-    /// SwiftNetwork's `QUICConnectionCore`, driven directly. Only connections that serve a stream
+    /// SwiftNetwork's `StandaloneQUICConnection`, driven directly. Only connections that serve a stream
     /// consumer, with a configuration it ``stateMachineSupports(_:)``, can use it; the others fall back to
     /// ``swiftNetwork``.
     case stateMachine

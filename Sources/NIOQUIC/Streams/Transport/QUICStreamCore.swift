@@ -35,6 +35,10 @@ struct QUICStreamCore: ~Copyable {
     @usableFromInline
     private(set) var id: QUICStreamID?
 
+    /// The standalone connection driver's state for the stream, if that drives it.
+    @usableFromInline
+    var flow: StandaloneStreamFlow?
+
     /// The state of a stream.
     private var state: QUICStreamStateMachine
 
@@ -845,7 +849,8 @@ extension QUICStreamCore {
         var delivered = 0
         var leftOver = false
         var reachedEnd = false
-        _ = stateMachine.read(id) { bytes, isFinished in
+        guard let flow = self.flow else { return .nothingAvailable }
+        stateMachine.read(flow) { bytes, isFinished in
             let available = bytes.byteCount
             var consumed = 0
             if available > 0 && (available >= contiguous || isFinished) {
@@ -857,7 +862,7 @@ extension QUICStreamCore {
             delivered = consumed
             leftOver = consumed < available
             reachedEnd = isFinished && !leftOver
-            return (consumed, ())
+            return consumed
         }
 
         if delivered > 0 {
@@ -882,8 +887,8 @@ extension QUICStreamCore {
     func writableBytes<Consumer: QUICStreamConsumer & ~Copyable>(
         on stateMachine: StateMachineQUICConnection<Consumer>
     ) -> Int {
-        guard let id = self.id, !self.state.isSendFinished else { return 0 }
-        return stateMachine.writableBytes(id)
+        guard self.flow != nil, !self.state.isSendFinished else { return 0 }
+        return stateMachine.writableBytes()
     }
 
     /// Hands queued writes to the state machine. See ``flush(fin:in:)``.
@@ -940,33 +945,21 @@ extension QUICStreamCore {
             throw NetworkError(streamStateViolation: refusalReason, operation: "flush")
         }
 
-        guard let id = self.id else {
+        guard let flow = self.flow else {
             self.pendingWrites.finalizeAllFramesAsFailed()
             throw NetworkError(streamStateViolation: "the stream has no ID", operation: "flush")
         }
 
-        // The core takes all of a write, or none once the stream or the connection can't send any
-        // more: for instance while the connection is closing (RFC 9000 Section 10.2), which the
-        // stream may not know yet. The rest of the queue fails with the refused write.
-        var refused = false
-        var outgoing = self.pendingWrites.drainArray()
-        outgoing.iterateMutableFrames { frame -> FrameArray.FrameIterationResult in
-            if !refused, let bytes = frame.bytes, bytes.byteCount > 0 {
-                refused = stateMachine.write(bytes, to: id, fin: false) < bytes.byteCount
-            }
-            frame.finalize(success: !refused)
-            return .removeFrameAndContinue
-        }
-        if refused {
+        // The protocol takes all of a write, or none once the stream or the connection can't send
+        // any more: for instance while the connection is closing (RFC 9000 Section 10.2), which the
+        // stream may not know yet. The queue fails with the refused write.
+        let outgoing = self.pendingWrites.drainArray()
+        if !stateMachine.write(outgoing, to: flow, fin: carriesFin) {
             // What the `SwiftNetwork` stack throws for a stream it can no longer send on.
             throw NetworkError.posix(ENOTCONN)
         }
-        if carriesFin {
-            stateMachine.finish(id)
-        }
     }
 
-    /// Resets the send side. See ``sendResetStream(code:in:)``.
     mutating func sendResetStream<Consumer: QUICStreamConsumer & ~Copyable>(
         code: QUICApplicationErrorCode,
         on stateMachine: StateMachineQUICConnection<Consumer>
@@ -980,8 +973,8 @@ extension QUICStreamCore {
         switch action {
         case .sendReset:
             self.pendingWrites.finalizeAllFramesAsFailed()
-            if let id = self.id {
-                stateMachine.resetStream(id, code: code)
+            if let flow = self.flow {
+                stateMachine.resetStream(flow, code: code)
             }
         case .ignore(.alreadyFinished):
             ()
@@ -1005,8 +998,8 @@ extension QUICStreamCore {
         case .markReadClosed:
             self.undeliveredReads.finalizeAllFramesAsFailed()
             self.finPending = false
-            if let id = self.id {
-                stateMachine.stopSending(id, code: code)
+            if let flow = self.flow {
+                stateMachine.stopSending(flow, code: code)
             }
         case .ignoreAlreadyClosed:
             ()
@@ -1045,11 +1038,13 @@ extension QUICStreamCore {
         case .ignoreAlreadyClosed:
             ()
         }
-        if sendOpen {
-            stateMachine.resetStream(id, code: QUICApplicationErrorCode(0)!)
-        }
-        if receiveOpen {
-            stateMachine.stopSending(id, code: QUICApplicationErrorCode(0)!)
+        if let flow = self.flow {
+            if sendOpen {
+                stateMachine.resetStream(flow, code: QUICApplicationErrorCode(0)!)
+            }
+            if receiveOpen {
+                stateMachine.stopSending(flow, code: QUICApplicationErrorCode(0)!)
+            }
         }
         self.abandonLocally()
         self.finPending = false

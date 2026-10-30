@@ -128,7 +128,7 @@ final class QUICStreamTable<Consumer: QUICStreamConsumer & ~Copyable> {
     /// The `SwiftNetwork` stack, or `nil` if a ``StateMachineQUICConnection`` drives the streams.
     private let swiftNetwork: SwiftNetworkBacking?
 
-    /// The connection driving the streams through its `QUICConnectionCore`, or `nil` if they run on
+    /// The connection driving the streams through its `StandaloneQUICConnection`, or `nil` if they run on
     /// the `SwiftNetwork` stack.
     ///
     /// Held strongly; ``retireAnchor()`` breaks the cycle with the connection.
@@ -279,9 +279,12 @@ extension QUICStreamTable where Consumer: ~Copyable {
     @inlinable
     func insertSlot(
         id: QUICStreamID?,
-        state: consuming Consumer.StreamState?
+        state: consuming Consumer.StreamState?,
+        flow: StandaloneStreamFlow? = nil
     ) -> QUICStreamHandle {
-        let transportState = QUICStreamTransportState(core: QUICStreamCore(id: id))
+        var core = QUICStreamCore(id: id)
+        core.flow = flow
+        let transportState = QUICStreamTransportState(core: core)
         let handle = self._transportStates.insert(transportState)
         let consumerStatePointer = self._consumerStates.reserve(at: handle.index)
 
@@ -338,6 +341,11 @@ extension QUICStreamTable where Consumer: ~Copyable {
         transport.pointee.flowIdentifier = linkage.identifier
         assert(self._byFlowIdentifier[linkage.identifier] == nil)  // A flow attaches to at most one stream.
         self._byFlowIdentifier[linkage.identifier] = handle
+    }
+
+    /// Gives a locally opened stream's slot the driver's state for the stream.
+    func attachFlow(_ flow: StandaloneStreamFlow, to handle: QUICStreamHandle) {
+        self._transportStates.withValue(for: handle) { $0.core.flow = flow }
     }
 
     /// Records the ID the stack assigned, indexes it, and connects the stream's state machine.
@@ -702,7 +710,7 @@ extension QUICStreamTable where Consumer: ~Copyable {
             assert(removed == handle)
             transport.pointee.core.close(on: stateMachine, id: id)
         } else {
-            stateMachine.cancelPendingOpen(handle)
+            stateMachine.cancelPendingOpen(flow: transport.pointee.core.flow)
             transport.pointee.core.abandonLocally()
         }
 
@@ -816,8 +824,8 @@ extension QUICStreamTable where Consumer: ~Copyable {
                 min(minContiguous, self.receiveWindows.largestMinContiguous(for: $0, role: self.role))
             } ?? minContiguous
         if let stateMachine = self.stateMachine {
-            guard let id else { return .nothingAvailable }
-            return transport.pointee.core.read(minContiguous: minContiguous, from: stateMachine, id: id, body)
+            guard id != nil else { return .nothingAvailable }
+            return transport.pointee.core.read(minContiguous: minContiguous, from: stateMachine, id: id!, body)
         }
         return transport.pointee.core.read(
             minContiguous: minContiguous,

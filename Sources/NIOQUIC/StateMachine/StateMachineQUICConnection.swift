@@ -19,14 +19,78 @@ import NIOQUICHelpers
 @_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
 @_spi(SwiftTLSOptions) @_spi(SwiftTLSProtocol) import SwiftTLS
 
-/// A QUIC connection driven directly from NIO through SwiftNetwork's `QUICConnectionCore`, without
-/// the SwiftNetwork framework.
+#if canImport(Darwin)
+import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#elseif canImport(Musl)
+import Musl
+#endif
+
+/// A datagram's buffer, which the connection builds its packet in.
 ///
-/// Inbound datagrams are decrypted in place in their `ByteBuffer`s, outbound datagrams are written
-/// straight into fresh `ByteBuffer`s, and one scheduled task serves the connection's timer.
+/// The standalone protocol asks the driver for the frames it builds datagrams in. Each is a
+/// `ByteBuffer` the driver hands out (wrapped by a `Frame`, which owns this box), and the finished
+/// datagram goes to NIO as that same buffer, with the packet's offset and length.
+@available(anyAppleOS 26, *)
+final class OutputDatagram {
+    var buffer: ByteBuffer
+
+    init(buffer: ByteBuffer) {
+        self.buffer = buffer
+    }
+
+    /// A frame over `size` bytes of a new buffer.
+    static func makeFrame(size: Int, allocator: ByteBufferAllocator) -> Frame {
+        var buffer = allocator.buffer(capacity: size)
+        // Mark the whole capacity as in use: the frame wraps all of it, and the packet's offset and
+        // length are set when the datagram is taken back.
+        buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: size) { _ in size }
+        let box = OutputDatagram(buffer: buffer)
+        let pointer = box.buffer.withUnsafeMutableReadableBytes { $0 }
+        return Frame(customBuffer: pointer, owner: box)
+    }
+
+    /// Takes the datagram out of a finished frame, without copying it if the frame is one of ours.
+    static func datagram(from frame: borrowing Frame, allocator: ByteBufferAllocator) -> ByteBuffer? {
+        let length = frame.unclaimedLength
+        guard length > 0 else { return nil }
+        var base: UnsafeMutableRawPointer?
+        var owned: OutputDatagram?
+        switch frame.buffer {
+        case .customOwner(let pointer, let owner):
+            base = pointer.baseAddress
+            // The owner is the box this file made when the frame is one of ours, which its class says.
+            if ObjectIdentifier(type(of: owner)) == ObjectIdentifier(OutputDatagram.self) {
+                owned = unsafeDowncast(owner, to: OutputDatagram.self)
+            }
+        default:
+            break
+        }
+        if let owned, let base,
+            let start = frame.span?.withUnsafeBufferPointer({ UnsafeRawPointer($0.baseAddress) })
+        {
+            let offset = start - UnsafeRawPointer(base)
+            owned.buffer.moveReaderIndex(to: offset)
+            owned.buffer.moveWriterIndex(to: offset + length)
+            return owned.buffer
+        }
+        var buffer = allocator.buffer(capacity: length)
+        frame.span?.withUnsafeBufferPointer { _ = buffer.writeBytes($0) }
+        return buffer
+    }
+}
+
+/// A QUIC connection driven directly from NIO through SwiftNetwork's `StandaloneQUICConnection`:
+/// a protocol that owns its own event context, with no linkages, no call-out queue and no
+/// scheduler for NIO to implement.
+///
+/// NIO feeds it datagrams and the time, collects the datagrams it queued, drains its events, and
+/// arms one scheduled task for the deadline it asks for.
 @available(anyAppleOS 26, *)
 final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable> {
-    private var core: QUICConnectionCore
+    private var quic: StandaloneQUICConnection
+    private let environment: StandaloneEnvironment
     let role: Role
     let localAddress: SocketAddress
     /// The address of the active path, which the channel reports.
@@ -44,27 +108,21 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// Datagrams received in the current read loop, processed on `receivePacketsComplete`.
     private var inbound: Deque<AddressedEnvelope<ByteBuffer>> = []
 
-    /// The core paths a server knows, by the client address they lead to, in the order they were
-    /// added; the handshake's path first. A client only has the one to the server.
-    private var paths: [(address: SocketAddress, id: CorePathID)]
-    private var nextPathID = CorePathID.initial.rawValue + 1
+    /// The paths a server knows, by the client address they lead to, in the order they were added;
+    /// the handshake's path first. A client only has the one to the server.
+    private var paths: [(address: SocketAddress, id: StandalonePathID)]
 
-    /// The most paths a server keeps. Anyone who sees a connection's packets can send copies from
-    /// other addresses, each of which the core takes for a new path (RFC 9000 Section 9.3.2), so
-    /// a new address beyond this replaces the oldest path other than the active one.
+    /// The most paths a server keeps.
     static var maximumPaths: Int { 4 }
     private var inReadLoop = false
+    /// Whether the connection was told its outbound data is batched.
+    private var batching = false
 
     private var timer: Scheduled<Void>?
     private var timerDeadline: NetworkClock.Instant?
 
-    /// A datagram the core built for a later departure, and when it leaves (RFC 9002 Section
-    /// 7.7). The core paces each datagram as it builds it, so the driver holds this one, and
-    /// builds no more, until the timer sends it.
-    private var pacedDatagram: (datagram: AddressedEnvelope<ByteBuffer>, departure: NetworkClock.Instant)?
-
-    /// Locally opened streams waiting for the peer to allow more streams.
-    private var pendingOpens: Deque<(handle: QUICStreamHandle, bidirectional: Bool)> = []
+    /// The streams, by the flow the stack's events name.
+    private var flows = StandaloneFlowWindow()
 
     /// Whether a drain of the connection's output is scheduled for the next loop tick.
     private var drainScheduled = false
@@ -75,21 +133,17 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private var reportedClose = false
     /// Whether the close was initiated locally, through `close(...)`.
     private var closedLocally = false
-    /// Whether the core reported `.closed`: it needs no more driving.
+    /// Whether the connection reported its disconnect: it needs no more driving.
     private(set) var isClosed = false
 
-    /// Where the connection sends once its channel is gone, while the core closes or drains.
+    /// Where the connection sends once its channel is gone, while it closes or drains.
     private var closingTransport: QUICHandler<Consumer>.ChildView?
-    /// Runs when the core closed after the channel went away; the handler stops routing to the
+    /// Runs when the connection closed after the channel went away; the handler stops routing to the
     /// connection. Holds the handler, which holds the connection, until then.
     private var onClosedWithoutChannel: (() -> Void)?
 
     /// The largest UDP payload sent.
     private let maximumDatagramSize: Int
-
-    /// The version a client sends its first Initial in to force Version Negotiation: a reserved
-    /// version no server supports (RFC 9000 Section 15).
-    private static var versionNegotiationGreaseVersion: UInt32 { 0x1a2a_3a4a }
 
     #if DEBUG
     /// Runs when the connection is released, so tests can check that nothing keeps it alive.
@@ -99,9 +153,9 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         self._forTesting_onDeinit?()
     }
 
-    /// The core's congestion window, in bytes.
+    /// The congestion window, in bytes. The standalone protocol doesn't expose it.
     var _forTesting_congestionWindow: Int {
-        self.core.congestionWindow
+        0
     }
 
     /// The paths the driver keeps.
@@ -116,7 +170,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     #endif
 
     private init(
-        core: consuming QUICConnectionCore,
+        quic: consuming StandaloneQUICConnection,
+        environment: StandaloneEnvironment,
         maximumDatagramSize: Int,
         role: Role,
         localAddress: SocketAddress,
@@ -124,49 +179,60 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         eventLoop: any EventLoop,
         logger: Logger
     ) {
-        self.core = core
+        self.paths = [(remoteAddress, quic.primaryPath)]
+        self.quic = quic
+        self.environment = environment
         self.maximumDatagramSize = maximumDatagramSize
         self.role = role
         self.localAddress = localAddress
         self.remoteAddress = SendableAddress(remoteAddress)
-        self.paths = [(remoteAddress, .initial)]
         self.eventLoop = eventLoop
         self.allocator = ByteBufferAllocator()
         self.logger = logger
     }
 
-    static func makeCoreConfiguration(
+    /// The QUIC options of a connection.
+    private static func makeOptions(
         _ configuration: QUICConfiguration,
-        tlsOptions: SwiftTLSProtocol.Options
-    ) -> QUICConnectionCore.Configuration {
-        var coreConfiguration = QUICConnectionCore.Configuration(tlsOptions: tlsOptions)
-        coreConfiguration.initialMaxData = UInt64(configuration.initialMaxData)
-        coreConfiguration.initialMaxStreamDataBidirectionalLocal = UInt64(configuration.initialMaxStreamDataBidiLocal)
-        coreConfiguration.initialMaxStreamDataBidirectionalRemote = UInt64(configuration.initialMaxStreamDataBidiRemote)
-        coreConfiguration.initialMaxStreamDataUnidirectional = UInt64(configuration.initialMaxStreamDataUni)
-        coreConfiguration.initialMaxStreamsBidirectional = UInt64(configuration.initialMaxStreamsBidi)
-        coreConfiguration.initialMaxStreamsUnidirectional = UInt64(configuration.initialMaxStreamsUni)
-        coreConfiguration.maxIdleTimeout = NetworkDuration(duration: configuration.maxIdleTimeout)
-        // As on the SwiftNetwork driver, keepalives never close the connection: the idle timeout
-        // does once they go unanswered.
-        coreConfiguration.keepAliveInterval = configuration.keepAliveInterval.map(NetworkDuration.init(duration:))
-        // Initial packets are padded to the configured size, and no packet is larger. Every QUIC
-        // path carries 1200 bytes (RFC 9000 Section 14).
-        let packetSize = max(configuration.initialPacketSize.size(forClientInitial: nil), 1200)
-        coreConfiguration.initialDatagramSize = packetSize
-        coreConfiguration.maxDatagramSize = packetSize
-        // A `max_datagram_frame_size` of zero is the same as none: no DATAGRAM frames (RFC 9221
-        // Section 3). The SwiftNetwork driver sends at most 65535.
-        let maxDatagramFrameSize = UInt16(clamping: configuration.maxDatagramFrameSize)
-        coreConfiguration.maxDatagramFrameSize = maxDatagramFrameSize > 0 ? UInt64(maxDatagramFrameSize) : nil
-        // Spread each congestion window over the RTT rather than sending it in one burst (RFC
-        // 9002 Section 7.7); `drainPacketsToSend(to:)` holds datagrams for their departure time.
-        coreConfiguration.pacingEnabled = true
-        // The driver issues no spare connection IDs and routes none (`.newLocalConnectionID`),
-        // so a peer can't migrate to a new connection ID: it only follows a NAT rebinding,
-        // which keeps the connection IDs (RFC 9000 Sections 9 and 18.2).
-        coreConfiguration.disableActiveMigration = true
-        return coreConfiguration
+        role: Role,
+        sourceConnectionID: QUICConnectionID,
+        serverName: String,
+        asyncVerifier: AsyncVerifier?,
+        authenticator: Authenticator?,
+        statelessResetToken: SwiftNetwork.QUICStatelessResetToken?
+    ) throws -> ProtocolOptions<QUICProtocol> {
+        let quicOptions = try QUICStreamProtocol.options(from: configuration)
+        switch role {
+        case .client:
+            quicOptions.connectionOptions.forceVersionNegotiation = configuration.forceVersionNegotiation
+            quicOptions.tlsOptions = try .clientOptions(
+                from: configuration,
+                asyncVerifier: asyncVerifier,
+                serverName: serverName
+            )
+        case .server:
+            guard let authConfig = configuration.authenticationConfiguration else {
+                throw QUICError.tlsConfigurationIncomplete
+            }
+            quicOptions.connectionOptions.retry = configuration.sendRetry
+            quicOptions.tlsOptions = try .serverOptions(
+                from: configuration,
+                authConfig: authConfig,
+                authenticator: authenticator,
+                serverName: serverName
+            )
+        }
+        // '!' is okay: the `options(...)` call above throws if this isn't set.
+        let perProtocolOptions = quicOptions.perProtocolOptions!
+        // The driver routes no spare connection IDs.
+        perProtocolOptions.quicConnectionOptions.disableAutomaticNewConnectionIDs = true
+        if let statelessResetToken, sourceConnectionID.length > 0, role == .server {
+            perProtocolOptions.quicConnectionOptions.initialStatelessResetToken = statelessResetToken
+        }
+        sourceConnectionID.withUnsafeBufferPointer { bufferPointer in
+            perProtocolOptions.quicConnectionOptions.sourceConnectionID = Array(bufferPointer)
+        }
+        return quicOptions
     }
 
     static func client(
@@ -182,35 +248,24 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         guard let serverName else {
             throw QUICError.tlsConfigurationIncomplete
         }
-        let tlsOptions = try TLSProtocol.Options.clientOptions(
-            from: configuration,
+        let options = try Self.makeOptions(
+            configuration,
+            role: .client,
+            sourceConnectionID: sourceConnectionID,
+            serverName: serverName,
             asyncVerifier: asyncVerifier,
-            serverName: serverName
+            authenticator: nil,
+            statelessResetToken: nil
         )
-        var coreConfiguration = Self.makeCoreConfiguration(configuration, tlsOptions: tlsOptions)
-        if configuration.forceVersionNegotiation {
-            // The server answers with Version Negotiation, and the client starts over in QUIC
-            // version 1 (RFC 9000 Section 6).
-            coreConfiguration.clientInitialVersion = Self.versionNegotiationGreaseVersion
-        }
-        let core = QUICConnectionCore(
-            clientWith: coreConfiguration,
-            localConnectionID: SwiftNetwork.QUICConnectionID(sourceConnectionID),
-            destinationConnectionID: SwiftNetwork.QUICConnectionID(8),
-            now: Self.now
-        )
-        let connection = StateMachineQUICConnection(
-            core: core,
-            maximumDatagramSize: coreConfiguration.maxDatagramSize,
+        return try Self.make(
+            options: options,
+            configuration: configuration,
             role: .client,
             localAddress: localAddress,
             remoteAddress: remoteAddress,
             eventLoop: eventLoop,
             logger: logger
         )
-        connection.makeStreamTable(configuration: configuration)
-        connection.installAsyncContinuationHandler()
-        return connection
     }
 
     static func server(
@@ -225,61 +280,86 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         eventLoop: any EventLoop,
         logger: Logger
     ) throws -> StateMachineQUICConnection<Consumer> {
-        guard let serverName = configuration.serverName,
-            let authConfig = configuration.authenticationConfiguration
-        else {
+        guard let serverName = configuration.serverName else {
             throw QUICError.tlsConfigurationIncomplete
         }
-        let tlsOptions = try TLSProtocol.Options.serverOptions(
-            from: configuration,
-            authConfig: authConfig,
+        let options = try Self.makeOptions(
+            configuration,
+            role: .server,
+            sourceConnectionID: sourceConnectionID,
+            serverName: serverName,
+            asyncVerifier: nil,
             authenticator: authenticator,
-            serverName: serverName
+            statelessResetToken: sourceConnectionID.length > 0
+                ? statelessResetTokenGenerator.token(for: sourceConnectionID).token : nil
         )
-        var coreConfiguration = Self.makeCoreConfiguration(configuration, tlsOptions: tlsOptions)
-        // The token for the handshake connection ID, which lets a client recognize the stateless
-        // reset this server's handler sends once the connection is gone (RFC 9000 Section 10.3).
-        // Only a server sends one. Zero-length connection IDs have no token to derive.
-        if sourceConnectionID.length > 0 {
-            coreConfiguration.statelessResetToken = statelessResetTokenGenerator.token(for: sourceConnectionID).token
-        }
-        let core = QUICConnectionCore(
-            serverWith: coreConfiguration,
-            localConnectionID: SwiftNetwork.QUICConnectionID(sourceConnectionID),
-            originalDestinationConnectionID: SwiftNetwork.QUICConnectionID(originalDestinationConnectionID),
-            peerConnectionID: peerConnectionID.map { SwiftNetwork.QUICConnectionID($0) }
-                ?? SwiftNetwork.QUICConnectionID(0),
-            now: Self.now
-        )
-        let connection = StateMachineQUICConnection(
-            core: core,
-            maximumDatagramSize: coreConfiguration.maxDatagramSize,
+        return try Self.make(
+            options: options,
+            configuration: configuration,
             role: .server,
             localAddress: localAddress,
             remoteAddress: remoteAddress,
             eventLoop: eventLoop,
             logger: logger
         )
+    }
+
+    private static func make(
+        options: ProtocolOptions<QUICProtocol>,
+        configuration: QUICConfiguration,
+        role: Role,
+        localAddress: SocketAddress,
+        remoteAddress: SocketAddress,
+        eventLoop: any EventLoop,
+        logger: Logger
+    ) throws -> StateMachineQUICConnection<Consumer> {
+        let environment = StandaloneEnvironment(
+            identifier: "swift-nio-quic-standalone-\(role.description)",
+            now: Self.now
+        )
+        let packetSize = max(configuration.initialPacketSize.size(forClientInitial: nil), 1200)
+        let outputAllocator = ByteBufferAllocator()
+        environment.maximumOutputSize = packetSize
+        environment.setOutputFrameProvider { size in
+            OutputDatagram.makeFrame(size: size, allocator: outputAllocator)
+        }
+        let quic = try StandaloneQUICConnection(
+            options: options,
+            isServer: role == .server,
+            local: localAddress.toEndpoint(),
+            remote: remoteAddress.toEndpoint(),
+            environment: environment,
+            releasesFlowsOnDisconnect: true
+        )
+        let connection = StateMachineQUICConnection(
+            quic: quic,
+            environment: environment,
+            maximumDatagramSize: packetSize,
+            role: role,
+            localAddress: localAddress,
+            remoteAddress: remoteAddress,
+            eventLoop: eventLoop,
+            logger: logger
+        )
         connection.makeStreamTable(configuration: configuration)
-        connection.installAsyncContinuationHandler()
+        connection.installWorkAvailableHandler()
+        connection.quic.connect()
+        connection.afterUpdate()
         return connection
     }
 
     private func makeStreamTable(configuration: QUICConfiguration) {
         let table = QUICStreamTable<Consumer>(role: self.role, stateMachine: self)
-        // The core grows a stream's window only as the application consumes (CoreStreams'
-        // `updateReceiveLimit`), so reads must not wait for more than it lets in.
         table.receiveWindows = ReceiveWindows(configuration)
         self.streamTable = table
     }
 
-    /// What the async continuation handler resumes.
+    /// What the work-available handler runs.
     ///
-    /// SwiftTLS keeps copies of the handler, in its handshake state machines, past
-    /// `setAsyncContinuationHandler(nil)`, so the handler reaches the connection through this
-    /// target: `dropChannelReferences()` clears it, which breaks the cycle through the core even
-    /// if the handshake never completes.
-    private final class AsyncContinuationTarget {
+    /// Another thread (an asynchronous certificate verification) may ask for a turn; the handler
+    /// reaches the connection through this target, which `dropChannelReferences()` clears, so the
+    /// environment does not keep the connection alive.
+    private final class WorkTarget {
         var connection: StateMachineQUICConnection?
 
         init(_ connection: StateMachineQUICConnection) {
@@ -287,23 +367,19 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         }
     }
 
-    private var asyncContinuationTarget: AsyncContinuationTarget?
+    private var workTarget: WorkTarget?
 
-    private func installAsyncContinuationHandler() {
-        #if canImport(SwiftTLS)
+    private func installWorkAvailableHandler() {
         let eventLoop = self.eventLoop
-        let target = AsyncContinuationTarget(self)
-        self.asyncContinuationTarget = target
+        let target = WorkTarget(self)
+        self.workTarget = target
         let loopBound = NIOLoopBound(target, eventLoop: eventLoop)
-        self.core.setAsyncContinuationHandler { result in
+        self.environment.scheduler.onWorkAvailable = {
             eventLoop.execute {
-                // The connection is gone once its channel was torn down.
                 guard let connection = loopBound.value.connection else { return }
-                connection.core.resumeHandshake(with: result, now: Self.now)
-                connection.afterCoreUpdate()
+                connection.afterUpdate()
             }
         }
-        #endif
     }
 
     // MARK: Clock
@@ -328,7 +404,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     }
 
     var isTerminating: Bool {
-        self.core.isTerminating
+        self.closedLocally || self.isClosed
     }
 
     @discardableResult
@@ -336,62 +412,77 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         if !self.inReadLoop {
             self.inReadLoop = true
             self.streamTable?.inReadLoop = true
+            self.setBatching(true)
         }
         self.inbound.append(envelope)
         return envelope.data.readableBytes
     }
 
     func receivePacketsComplete() {
-        let now = Self.now
+        self.environment.scheduler.advance(to: Self.now)
+        // Hand the connection the whole read loop's datagrams at once, per path.
+        var batch = FrameArray(capacity: max(self.inbound.count, 1))
+        var batchPath: StandalonePathID?
         while var envelope = self.inbound.popFirst() {
             let path = self.path(for: envelope.remoteAddress)
-            envelope.data.withUnsafeMutableReadableBytes { pointer in
-                var span = MutableSpan(_unsafeElements: pointer.bindMemory(to: UInt8.self))
-                self.core.receive(&span, on: path, now: now)
+            if let current = batchPath, current != path {
+                self.quic.receiveFromBelow(path: current, batch.drainArray())
             }
+            batchPath = path
+            Self.append(&envelope.data, to: &batch)
         }
-        self.afterCoreUpdate()
+        if let path = batchPath, !batch.isEmpty {
+            self.quic.receiveFromBelow(path: path, batch.drainArray())
+        }
+        self.afterUpdate()
+    }
+
+    /// Adds the datagram to `frames` without copying its storage.
+    private static func append(_ buffer: inout ByteBuffer, to frames: inout FrameArray) {
+        buffer.withUnsafeMutableReadableBytesWithStorageManagement2 { pointer, owner in
+            frames.add(frame: Frame(customBuffer: pointer, owner: owner))
+        }
+    }
+
+    /// Tells the connection whether the application batches its outbound data, so it packs a
+    /// batch's data into as few datagrams as it can.
+    private func setBatching(_ enabled: Bool) {
+        guard self.batching != enabled else { return }
+        self.batching = enabled
+        self.quic.applicationEvent(enabled ? .outboundDataBatchStart : .outboundDataBatchEnd)
     }
 
     // MARK: Paths
 
-    /// The core path for a datagram from `address`, added if it is new.
-    ///
-    /// The core moves a server to a path once a non-probing packet arrives there, and validates
-    /// the path (RFC 9000 Section 9.3), which is how a server follows a client's NAT rebinding.
-    private func path(for address: SocketAddress) -> CorePathID {
-        // A client only talks to the server's address; the server doesn't migrate.
-        guard self.role == .server else { return self.core.activePathID }
+    /// The path for a datagram from `address`, added if it is new.
+    private func path(for address: SocketAddress) -> StandalonePathID {
+        // A client only talks to the server's address.
+        guard self.role == .server else { return self.quic.primaryPath }
         if let path = self.paths.first(where: { $0.address == address }) {
             return path.id
         }
         if self.paths.count >= Self.maximumPaths {
-            let activePath = self.core.activePathID
-            // '!' is fine: there are several paths, and only one is active.
-            let index = self.paths.firstIndex { $0.id != activePath }!
-            self.core.forgetPath(self.paths[index].id)
-            self.paths.remove(at: index)
+            // Drop the oldest path other than the handshake's.
+            self.paths.remove(at: 1)
         }
-        let path = CorePathID(self.nextPathID)
-        self.nextPathID += 1
-        self.paths.append((address, path))
-        return path
-    }
-
-    private func address(of path: CorePathID) -> SocketAddress? {
-        self.paths.first { $0.id == path }?.address
+        let local = self.localAddress.toEndpoint()
+        guard let id = try? self.quic.addPath(local: local, remote: address.toEndpoint()) else {
+            return self.quic.primaryPath
+        }
+        self.paths.append((address, id))
+        return id
     }
 
     func exitReadLoop() {
         self.inReadLoop = false
         self.streamTable?.inReadLoop = false
+        self.setBatching(false)
     }
 
-    /// Delivers the core's events and re-arms the timer.
-    private func afterCoreUpdate() {
+    /// Runs the timers that are due, delivers the connection's events and re-arms the timer.
+    private func afterUpdate() {
+        self.environment.turn(now: Self.now)
         self.processEvents()
-        self.openPendingStreams()
-        self.rescheduleTimer()
         if !self.inReadLoop {
             if let channelView = self.channelView {
                 channelView.drainOutbound()
@@ -400,110 +491,116 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
                 transport.flush()
             }
         }
+        self.rescheduleTimer()
     }
 
     private func processEvents() {
-        while let event = self.core.nextEvent() {
+        while let event = self.environment.nextEvent() {
             switch event {
-            case .connected:
+            case .connected(nil):
                 if !self.reportedHandshake {
                     self.reportedHandshake = true
-                    // As the SwiftNetwork driver does, hand over the peer's advertised frame size;
-                    // the core refuses a payload that doesn't fit a packet.
-                    self.channelView?.handshakeCompleted(
-                        peerMaxDatagramFrameSize: self.core.peerMaxDatagramFrameSize
-                    )
+                    self.channelView?.handshakeCompleted(peerMaxDatagramFrameSize: 0)
                 }
-            case .streamOpened(let id):
-                guard let table = self.streamTable else { continue }
-                let streamID = NIOQUICHelpers.QUICStreamID(rawValue: id)
-                let handle = table.insertSlot(id: streamID, state: nil)
-                table.assignID(streamID, to: handle)
-                table.markReady(handle: handle, events: .opened)
-            case .streamReadable(let id):
-                guard let table = self.streamTable,
-                    let handle = table.handle(forID: NIOQUICHelpers.QUICStreamID(rawValue: id))
-                else { continue }
-                table.markReady(handle: handle, events: .readable)
-            case .streamWritable(let id):
-                guard let table = self.streamTable,
-                    let handle = table.handle(forID: NIOQUICHelpers.QUICStreamID(rawValue: id))
-                else { continue }
-                table.markReady(handle: handle, events: .writable)
-            case .streamReset(let id, let errorCode):
-                guard let table = self.streamTable,
-                    let handle = table.handle(forID: NIOQUICHelpers.QUICStreamID(rawValue: id))
-                else { continue }
-                table.peerResetStream(handle, code: QUICApplicationErrorCode(errorCode)!)
-            case .stopSending(let id, let errorCode):
-                guard let table = self.streamTable,
-                    let handle = table.handle(forID: NIOQUICHelpers.QUICStreamID(rawValue: id))
-                else { continue }
-                table.peerStoppedSending(handle, code: QUICApplicationErrorCode(errorCode)!)
-            case .streamFinishedSending:
-                ()
-            case .datagramsReadable:
-                self.deliverDatagrams()
-            case .newLocalConnectionID, .retiredLocalConnectionID, .newPeerConnectionID, .retiredPeerConnectionID:
-                // The core issues no connection IDs on its own, and the peer's aren't routed yet.
-                ()
-            case .pathValidated:
-                ()
-            case .pathFailed(let path):
-                // The core went back to a validated path if this one was active (RFC 9000 Section
-                // 9.3.2); forget it unless it still is.
-                if path != self.core.activePathID {
-                    self.core.forgetPath(path)
-                    self.paths.removeAll { $0.id == path }
+            case .connected(let flow?):
+                self.flowConnected(flow)
+            case .newInboundFlow(let flow, let streamID):
+                self.newInboundFlow(flow, streamID: streamID)
+            case .inboundDataAvailable(let flow?):
+                self.mark(flow, .readable)
+            case .outboundRoomAvailable(let flow?):
+                self.mark(flow, .writable)
+            case .inboundAborted(let flow?, let error):
+                if let handle = self.flows[flow]?.handle, let code = Self.applicationErrorCode(error) {
+                    self.streamTable?.peerResetStream(handle, code: code)
                 }
-            case .activePathChanged(let path):
-                if let address = self.address(of: path) {
-                    self.logger.debug("Peer moved", metadata: [LoggingKeys.addressRemote: "\(address)"])
-                    self.remoteAddress.value = address
+            case .outboundAborted(let flow?, let error):
+                if let handle = self.flows[flow]?.handle, let code = Self.applicationErrorCode(error) {
+                    self.streamTable?.peerStoppedSending(handle, code: code)
                 }
-            case .earlyDataRejected, .transportParametersForResumption:
-                // Stream consumer connections don't enable 0-RTT.
+            case .disconnected(let flow?, let error):
+                self.flowDisconnected(flow, error: error)
+            case .disconnected(nil, let error):
+                self.connectionClosed(error: error)
+            case .outboundDataReady:
                 ()
-            case .streamClosed(let id):
-                guard let table = self.streamTable,
-                    let handle = table.handle(forID: NIOQUICHelpers.QUICStreamID(rawValue: id))
-                else { continue }
-                table.streamDisconnected(handle, error: nil)
-            case .closing(let reason):
-                // The connection carries no more data: tell the channel and its streams now,
-                // not after the closing or draining period (RFC 9000 Section 10.2). The core
-                // keeps running on this connection's timer until it reports `.closed`.
-                self.logger.debug("Connection closing", metadata: ["quic.close.reason": "\(reason)"])
-                // The connection sends nothing but CONNECTION_CLOSE from now on.
-                self.pacedDatagram = nil
-                self.reportClose(reason)
-            case .closed(let reason):
-                self.coreClosed(reason)
+            case .network, .inboundDataAvailable(nil), .outboundRoomAvailable(nil),
+                .inboundAborted(nil, _), .outboundAborted(nil, _):
+                ()
             }
         }
     }
 
-    /// Hands the DATAGRAM payloads received (RFC 9221) to the channel.
-    private func deliverDatagrams() {
-        let allocator = self.allocator
-        while let datagram = self.core.readDatagram({ bytes in
-            var buffer = allocator.buffer(capacity: bytes.byteCount)
-            _ = bytes.withUnsafeBytes { buffer.writeBytes($0) }
-            return buffer
-        }) {
-            self.channelView?.datagramRead(datagram)
+    private static func applicationErrorCode(_ error: NetworkError?) -> QUICApplicationErrorCode? {
+        switch error?.quicApplicationError {
+        case .some(let code) where code >= 0:
+            return QUICApplicationErrorCode(UInt64(code))
+        case .some, .none:
+            return nil
         }
     }
 
-    /// The core is closed: nothing is left to drive, and the connection can be released.
-    private func coreClosed(_ reason: QUICConnectionCore.CloseReason) {
+    // MARK: Flow events
+
+    private func mark(_ flow: StandaloneFlowID, _ events: QUICStreamEvents) {
+        guard let handle = self.flows[flow]?.handle else { return }
+        self.streamTable?.markReady(handle: handle, events: events)
+    }
+
+    /// A locally opened stream got its ID.
+    private func flowConnected(_ flowID: StandaloneFlowID) {
+        guard let flow = self.flows[flowID], flow.streamID == nil, let handle = flow.handle else { return }
+        guard let metadata = self.quic.getMetadata(flow: flowID) as ProtocolMetadata<QUICProtocol>?,
+            let streamID = metadata.streamID
+        else { return }
+        flow.streamID = streamID
+        self.streamTable?.assignID(NIOQUICHelpers.QUICStreamID(rawValue: streamID), to: handle)
+        self.streamTable?.markReady(handle: handle, events: .opened)
+    }
+
+    /// The peer opened a stream. The event carries the stream ID, so nothing is asked.
+    private func newInboundFlow(_ flowID: StandaloneFlowID, streamID: UInt64) {
+        guard let table = self.streamTable else {
+            self.quic.teardown(flow: flowID)
+            return
+        }
+        let quicStreamID = NIOQUICHelpers.QUICStreamID(rawValue: streamID)
+        let flow = StandaloneStreamFlow(flowID: flowID)
+        flow.streamID = streamID
+        let handle = table.insertSlot(id: quicStreamID, state: nil, flow: flow)
+        flow.handle = handle
+        self.flows.insert(flow)
+        table.assignID(quicStreamID, to: handle)
+        table.markReady(handle: handle, events: [.opened, .readable])
+    }
+
+    private func flowDisconnected(_ flowID: StandaloneFlowID, error: NetworkError?) {
+        guard let flow = self.flows[flowID] else { return }
+        if let handle = flow.handle {
+            self.streamTable?.streamDisconnected(handle, error: error)
+        }
+        // The connection releases the flow as it reports the disconnect: nothing to tear down.
+        self.flows.remove(flow.flowID)
+        if !flow.pending.isEmpty { flow.pending.finalizeAllFramesAsFailed() }
+    }
+
+    private func release(_ flow: StandaloneStreamFlow) {
+        guard self.flows[flow.flowID] != nil else { return }
+        self.flows.remove(flow.flowID)
+        if !flow.pending.isEmpty { flow.pending.finalizeAllFramesAsFailed() }
+        self.quic.teardown(flow: flow.flowID)
+    }
+
+    // MARK: Closing
+
+    /// The connection reported its disconnect: nothing is left to drive, and it can be released.
+    private func connectionClosed(error: NetworkError?) {
         self.timer?.cancel()
         self.timer = nil
         self.timerDeadline = nil
         self.isClosed = true
-        self.logger.debug("Connection closed", metadata: ["quic.close.reason": "\(reason)"])
-        // `.closing` always comes first, so this only reports a close the channel missed.
-        self.reportClose(reason)
+        self.logger.debug("Connection closed", metadata: ["quic.close.error": "\(String(describing: error))"])
+        self.reportClose(error: error)
         self.closingTransport = nil
         if let onClosedWithoutChannel = self.onClosedWithoutChannel {
             self.onClosedWithoutChannel = nil
@@ -513,42 +610,26 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     /// Tells the channel, once, that the connection closed, which fails its streams with the
     /// reason.
-    private func reportClose(_ reason: QUICConnectionCore.CloseReason) {
+    private func reportClose(error: NetworkError?) {
         guard !self.reportedClose else { return }
         self.reportedClose = true
-        let error: (any Error)?
-        switch reason {
-        case .idleTimeout, .keepAliveTimeout:
-            error = nil
-        case .local:
-            error = nil
-        case .peer(let code, let isApplication, let reason):
-            error = code == 0 ? nil : QUICConnectionError(reason: reason, isApplication: isApplication, code: code)
-        case .transportError(let code, let reason):
-            error = QUICConnectionError(reason: reason, isApplication: false, code: code)
-        case .statelessReset:
-            error = QUICConnectionError(reason: "stateless reset", isApplication: false, code: 0)
+        var reported: (any Error)?
+        if !self.closedLocally, let error, !error.isIdleTimeout {
+            if let code = error.quicTransportError, code != 0 {
+                reported = QUICConnectionError(reason: error.description, isApplication: false, code: UInt64(code))
+            } else if let code = error.quicApplicationError, code != 0 {
+                reported = QUICConnectionError(reason: error.description, isApplication: true, code: UInt64(code))
+            } else if error.quicApplicationError == nil, error.quicTransportError == nil {
+                reported = QUICConnectionError(reason: error.description, isApplication: false, code: 0)
+            }
         }
-        self.channelView?.connectionClosed(error: error)
+        self.channelView?.connectionClosed(error: reported)
     }
 
     // MARK: Timer
 
     private func rescheduleTimer() {
-        // The core's deadlines don't include pacing: the paced datagram's departure is the
-        // driver's own.
-        let deadline: NetworkClock.Instant
-        switch (self.core.nextDeadline, self.pacedDatagram?.departure) {
-        case (let coreDeadline?, let departure?):
-            deadline = min(coreDeadline, departure)
-        case (let coreDeadline?, nil):
-            deadline = coreDeadline
-        case (nil, let departure?):
-            deadline = departure
-        case (nil, nil):
-            // Nothing is due; a timer still armed fires as a no-op.
-            return
-        }
+        guard let deadline = self.environment.nextTimerDeadline else { return }
         // Rescheduling a NIO task is expensive. Keep an armed timer that fires no later than
         // needed: if it fires early, `timerFired` re-arms it for the real deadline.
         if let current = self.timerDeadline, self.timer != nil, current <= deadline {
@@ -564,8 +645,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     private func timerFired() {
         self.timer = nil
         self.timerDeadline = nil
-        self.core.handleTimeout(now: Self.now)
-        self.afterCoreUpdate()
+        self.afterUpdate()
     }
 
     // MARK: Output
@@ -580,60 +660,27 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     func drainPacketsToSend(to transport: some QUICTransport) {
         self.drainScheduled = false
-        // Stream operations since the last drain may have produced events.
+        self.environment.scheduler.advance(to: Self.now)
+        self.environment.turn()
         self.processEvents()
-        self.openPendingStreams()
-        let now = Self.now
-        // `now` has microseconds; a departure within that is due, so a timer fired for it
-        // never finds it early.
-        let dueBy = now.advanced(by: .microseconds(1))
-        // PATH_CHALLENGE and PATH_RESPONSE for other paths go out first, unpaced (RFC 9000
-        // Section 8.2).
-        while let path = self.core.pathWithProbeToSend, let address = self.address(of: path) {
-            var buffer = self.allocator.buffer(capacity: self.maximumDatagramSize)
-            let written = buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: self.maximumDatagramSize) {
-                pointer in
-                var span = MutableSpan(_unsafeElements: pointer.bindMemory(to: UInt8.self))
-                return self.core.send(into: &span, on: path, now: now) ?? 0
+        for index in self.paths.indices {
+            let (address, path) = self.paths[index]
+            var frames = self.quic.takeOutbound(path: path)
+            frames.iterateMutableFrames { frame -> FrameArray.FrameIterationResult in
+                if let datagram = OutputDatagram.datagram(from: frame, allocator: self.allocator) {
+                    transport.writeDatagram(AddressedEnvelope(remoteAddress: address, data: datagram), promise: nil)
+                }
+                frame.finalize(success: true)
+                return .removeFrameAndContinue
             }
-            guard written > 0 else { break }
-            transport.writeDatagram(AddressedEnvelope(remoteAddress: address, data: buffer), promise: nil)
-        }
-        if let (datagram, departure) = self.pacedDatagram {
-            guard departure < dueBy else {
-                // Still early: the timer drains again at its departure.
-                self.rescheduleTimer()
-                return
-            }
-            self.pacedDatagram = nil
-            transport.writeDatagram(datagram, promise: nil)
-        }
-        let remoteAddress = self.remoteAddress.value
-        while true {
-            var buffer = self.allocator.buffer(capacity: self.maximumDatagramSize)
-            let written = buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: self.maximumDatagramSize) {
-                pointer in
-                var span = MutableSpan(_unsafeElements: pointer.bindMemory(to: UInt8.self))
-                return self.core.send(into: &span, now: now) ?? 0
-            }
-            guard written > 0 else { break }
-            if let departure = self.core.departureTime, departure >= dueBy {
-                // The pacer holds this datagram back: keep it for the timer and stop here, as
-                // every later datagram leaves later still.
-                self.pacedDatagram = (AddressedEnvelope(remoteAddress: remoteAddress, data: buffer), departure)
-                break
-            }
-            transport.writeDatagram(AddressedEnvelope(remoteAddress: remoteAddress, data: buffer), promise: nil)
         }
         self.rescheduleTimer()
     }
 
-    // MARK: Closing
+    // MARK: Close
 
     func close(isApplicationClose: Bool, errorCode: Int64, reason: String) -> Bool {
-        guard !self.core.isTerminating else {
-            // The connection is already closing on its own: make sure the channel learned why,
-            // rather than pretending it is still alive.
+        guard !self.isTerminating else {
             self.processEvents()
             return false
         }
@@ -645,11 +692,22 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             ]
         )
         self.closedLocally = true
-        self.core.close(errorCode: UInt64(errorCode), isApplication: isApplicationClose, reason: reason, now: Self.now)
+        let error: NetworkError?
+        if isApplicationClose {
+            error = NetworkError(quicApplicationError: errorCode, reason: reason)
+        } else if let transportError = QUICTransportError(UInt64(errorCode), reason) {
+            error = NetworkError(quicTransportError: transportError)
+        } else {
+            error = nil
+        }
+        self.environment.scheduler.advance(to: Self.now)
+        self.quic.disconnect(error: error)
+        self.environment.turn()
+        self.processEvents()
         self.rescheduleTimer()
-        // As the SwiftNetwork connection does, report the close right away: the channel drains the
-        // CONNECTION_CLOSE and fires inactive once this returns. The core keeps answering the peer
-        // for the closing period on its own timer.
+        // Report the close right away: the channel drains the CONNECTION_CLOSE and fires inactive
+        // once this returns. The connection keeps answering the peer for the closing period on its
+        // own timer.
         if !self.reportedClose {
             self.reportedClose = true
             self.channelView?.connectionClosed(error: nil)
@@ -665,65 +723,51 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// The consumer is told about the connection closing through its stream table.
     func quiesceStreams() {}
 
-    /// Queues a DATAGRAM frame (RFC 9221). Returns `false` if the core refused it: it doesn't fit a
-    /// packet, or the connection is closing.
+    /// Datagram flows are not driven yet.
     func writeDatagram(_ datagram: ByteBuffer) -> Bool {
-        datagram.withUnsafeReadableBytes { pointer in
-            self.core.sendDatagram(RawSpan(_unsafeBytes: pointer))
-        }
+        false
     }
 
-    /// The channel drains the connection once the flush returns, which sends the queued datagrams.
     func flushDatagrams() {}
 
     func dropChannelReferences() {
         self.channelView = nil
         self.streamTable?.outOfBandDrain = nil
-        if self.core.isTerminating && !self.isClosed {
-            // The core still closes or drains (RFC 9000 Section 10.2): keep its timer, which
-            // holds the connection until the core reports `.closed`. The handler may route the
-            // peer's packets here meanwhile, see `continueClosing(transport:onClosed:)`.
+        if self.closedLocally && !self.isClosed {
+            // The connection still closes or drains (RFC 9000 Section 10.2): keep its timer, which
+            // holds the connection until it reports its disconnect.
         } else {
             self.timer?.cancel()
             self.timer = nil
             self.timerDeadline = nil
         }
-        #if canImport(SwiftTLS)
-        // The core releases the handler only once the handshake is confirmed or the connection
-        // closed. A connection closed during its handshake stops its timer here and never gets
-        // there, so break the cycle through the handler now.
-        self.core.setAsyncContinuationHandler(nil)
-        self.asyncContinuationTarget?.connection = nil
-        self.asyncContinuationTarget = nil
-        #endif
+        self.environment.scheduler.onWorkAvailable = nil
+        self.workTarget?.connection = nil
+        self.workTarget = nil
     }
 
-    /// Whether the channel is gone but the core still closes or drains, and wants the peer's
+    /// Whether the channel is gone but the connection still closes or drains, and wants the peer's
     /// packets until it is closed.
     var isClosingWithoutChannel: Bool {
-        self.channelView == nil && self.core.isTerminating && !self.isClosed
+        self.channelView == nil && self.closedLocally && !self.isClosed
     }
 
-    /// Keeps driving a connection whose channel went away until its core is closed: it answers
-    /// the packets `receiveWhileClosing(_:)` hands it, sending through `transport`, and runs
-    /// `onClosed` when the core is closed (or not at all if `abandonClosing()` runs first).
+    /// Keeps driving a connection whose channel went away until it is closed.
     func continueClosing(transport: QUICHandler<Consumer>.ChildView, onClosed: @escaping () -> Void) {
         precondition(self.isClosingWithoutChannel)
         self.closingTransport = transport
         self.onClosedWithoutChannel = onClosed
     }
 
-    /// Processes a datagram for a connection whose channel went away: while closing, the core
-    /// answers with CONNECTION\_CLOSE (RFC 9000 Section 10.2.1); while draining it ignores it.
+    /// Processes a datagram for a connection whose channel went away.
     func receiveWhileClosing(_ envelope: AddressedEnvelope<ByteBuffer>) {
         guard self.closingTransport != nil else { return }
         var datagram = envelope.data
-        let now = Self.now
-        datagram.withUnsafeMutableReadableBytes { pointer in
-            var span = MutableSpan(_unsafeElements: pointer.bindMemory(to: UInt8.self))
-            self.core.receive(&span, now: now)
-        }
-        self.afterCoreUpdate()
+        self.environment.scheduler.advance(to: Self.now)
+        var frames = FrameArray(capacity: 1)
+        Self.append(&datagram, to: &frames)
+        self.quic.receiveFromBelow(path: self.quic.primaryPath, frames)
+        self.afterUpdate()
     }
 
     /// Stops driving a connection whose channel went away: the handler is going away.
@@ -737,67 +781,163 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     // MARK: Streams
 
-    /// Opens a stream for a slot, or queues it until the peer allows more streams.
+    /// Opens a stream for a slot.
     func openStream(for handle: QUICStreamHandle, bidirectional: Bool) {
-        if let id = self.core.openStream(bidirectional: bidirectional) {
-            self.streamTable?.assignID(NIOQUICHelpers.QUICStreamID(rawValue: id), to: handle)
-            self.streamTable?.markReady(handle: handle, events: .opened)
+        guard bidirectional else {
+            // The standalone protocol opens bidirectional streams only.
+            self.streamTable?.streamDisconnected(handle, error: NetworkError.posix(ENOTSUP))
+            return
+        }
+        do throws(NetworkError) {
+            let flowID = try self.quic.openStream()
+            let flow = StandaloneStreamFlow(flowID: flowID)
+            flow.handle = handle
+            self.flows.insert(flow)
+            self.streamTable?.attachFlow(flow, to: handle)
+            self.quic.connect(flow: flowID)
+            self.environment.turn()
+            self.processEvents()
             self.outputProduced()
-        } else {
-            self.pendingOpens.append((handle, bidirectional))
+        } catch {
+            self.streamTable?.streamDisconnected(handle, error: error)
         }
     }
 
     /// Forgets a locally opened stream that never got an ID.
-    func cancelPendingOpen(_ handle: QUICStreamHandle) {
-        self.pendingOpens.removeAll { $0.handle == handle }
+    func cancelPendingOpen(flow: StandaloneStreamFlow?) {
+        guard let flow else { return }
+        self.release(flow)
     }
 
-    private func openPendingStreams() {
-        while let (handle, bidirectional) = self.pendingOpens.first {
-            guard let id = self.core.openStream(bidirectional: bidirectional) else { return }
-            self.pendingOpens.removeFirst()
-            self.streamTable?.assignID(NIOQUICHelpers.QUICStreamID(rawValue: id), to: handle)
-            self.streamTable?.markReady(handle: handle, events: .opened)
-        }
-    }
-
-    func read<Result>(
-        _ streamID: QUICStreamID,
-        _ body: (RawSpan, _ isFinished: Bool) -> (consumed: Int, result: Result)
-    ) -> Result? {
-        let result = self.core.read(from: streamID.rawValue, body)
-        self.outputProduced()
-        return result
-    }
-
-    func writableBytes(_ streamID: QUICStreamID) -> Int {
-        self.core.writableBytes(on: streamID.rawValue)
-    }
-
+    /// Hands what the stream holds to `body`, which returns how many bytes it took. Whether `body`
+    /// ran is returned.
     @discardableResult
-    func write(_ bytes: RawSpan, to streamID: QUICStreamID, fin: Bool) -> Int {
-        let written = self.core.write(bytes, to: streamID.rawValue, fin: fin)
+    func read(
+        _ flow: StandaloneStreamFlow,
+        _ body: (RawSpan, _ isFinished: Bool) -> Int
+    ) -> Bool {
+        // The bytes wait in the stack's own receive queue for this visit, so they are read from what
+        // the pull returns: the stream's queue here only holds what the consumer left behind.
+        var frames: FrameArray
+        let pulled: FrameArray? =
+            flow.sawFin ? nil : (try? self.quic.receiveStreamData(flow: flow.flowID, minimumBytes: 1, maximumBytes: Int.max))
+        if flow.pending.isEmpty {
+            frames = pulled ?? FrameArray()
+        } else {
+            if let pulled { flow.pending.add(frames: pulled) }
+            frames = flow.pending.drainArray()
+        }
+
+        // The consumer sees the bytes the stack holds as one contiguous run, as it would from a
+        // receive buffer: merge frames when there are several.
+        Self.coalesce(&frames)
+
+        var ran = false
+        frames.iterateMutableFrames { frame -> FrameArray.FrameIterationResult in
+            let available = frame.unclaimedLength
+            let isFinished = frame.connectionComplete
+            if isFinished { flow.sawFin = true }
+            let consumed: Int
+            if let bytes = frame.bytes {
+                consumed = body(bytes, isFinished)
+            } else {
+                consumed = body(RawSpan(), isFinished)
+            }
+            ran = true
+            if consumed >= available {
+                frame.finalize(success: true)
+                return .removeFrameAndContinue
+            }
+            if consumed > 0 {
+                _ = frame.claim(fromStart: consumed)
+            }
+            return .stopIterating
+        }
+        if !frames.isEmpty {
+            // The consumer left bytes: keep them for its next read.
+            flow.pending.add(frames: frames)
+        }
+        if !ran, flow.sawFin {
+            // The FIN arrived on its own, and was consumed with an earlier read.
+            _ = body(RawSpan(), true)
+            ran = true
+        }
         self.outputProduced()
-        return written
+        return ran
     }
 
-    func finish(_ streamID: QUICStreamID) {
-        self.core.finish(streamID.rawValue)
+    private static func coalesce(_ frames: inout FrameArray) {
+        guard frames.count > 1 else { return }
+        var total = 0
+        var isFinal = false
+        frames.iterateMutableFrames { frame -> FrameArray.FrameIterationResult in
+            total += frame.unclaimedLength
+            isFinal = isFinal || frame.connectionComplete
+            return .continueIterating
+        }
+        var merged = Frame(count: total)
+        var offset = 0
+        frames.iterateMutableFrames { frame -> FrameArray.FrameIterationResult in
+            let length = frame.unclaimedLength
+            if length > 0, let source = frame.span, var target = merged.mutableSpan {
+                source.withUnsafeBufferPointer { source in
+                    target.withUnsafeMutableBufferPointer { target in
+                        UnsafeMutableRawBufferPointer(rebasing: UnsafeMutableRawBufferPointer(target)[offset..<offset + length])
+                            .copyMemory(from: UnsafeRawBufferPointer(source))
+                    }
+                }
+                offset += length
+            }
+            frame.finalize(success: true)
+            return .removeFrameAndContinue
+        }
+        if isFinal {
+            merged.metadataComplete = true
+            merged.connectionComplete = true
+        }
+        frames.add(frame: merged)
+    }
+
+    func writableBytes() -> Int {
+        // The protocol queues whatever it is given and applies flow control itself.
+        4 << 20
+    }
+
+    /// Hands frames to a stream, with the FIN on the last one if `fin`. Returns whether the
+    /// protocol took them.
+    @discardableResult
+    func write(_ frames: consuming FrameArray, to flow: StandaloneStreamFlow, fin: Bool) -> Bool {
+        var frames = frames
+        if fin {
+            if frames.isEmpty {
+                frames.add(frame: Frame(count: 0))
+            }
+            var remaining = frames.count
+            frames.iterateMutableFrames { frame -> FrameArray.FrameIterationResult in
+                remaining -= 1
+                if remaining == 0 {
+                    frame.metadataComplete = true
+                    frame.connectionComplete = true
+                }
+                return .continueIterating
+            }
+        }
+        do throws(NetworkError) {
+            try self.quic.sendStreamData(flow: flow.flowID, frames, early: false)
+        } catch {
+            return false
+        }
+        self.outputProduced()
+        return true
+    }
+
+    func resetStream(_ flow: StandaloneStreamFlow, code: QUICApplicationErrorCode) {
+        try? self.quic.abortOutbound(flow: flow.flowID, error: NetworkError(quicApplicationError: Int64(code.rawValue)))
         self.outputProduced()
     }
 
-    func resetStream(_ streamID: QUICStreamID, code: QUICApplicationErrorCode) {
-        self.core.resetStream(streamID.rawValue, errorCode: code.rawValue)
+    func stopSending(_ flow: StandaloneStreamFlow, code: QUICApplicationErrorCode) {
+        try? self.quic.abortInbound(flow: flow.flowID, error: NetworkError(quicApplicationError: Int64(code.rawValue)))
         self.outputProduced()
-    }
-
-    func stopSending(_ streamID: QUICStreamID, code: QUICApplicationErrorCode) {
-        self.core.stopSending(streamID.rawValue, errorCode: code.rawValue)
-        self.outputProduced()
-    }
-
-    func hasStream(_ streamID: QUICStreamID) -> Bool {
-        self.core.hasStream(streamID.rawValue)
     }
 }
