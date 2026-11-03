@@ -511,11 +511,11 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             case .outboundRoomAvailable(let flow?):
                 self.mark(flow, .writable)
             case .inboundAborted(let flow?, let error):
-                if let handle = self.flows[flow]?.handle, let code = Self.applicationErrorCode(error) {
+                if let handle = self.flows[flow], let code = Self.applicationErrorCode(error) {
                     self.streamTable?.peerResetStream(handle, code: code)
                 }
             case .outboundAborted(let flow?, let error):
-                if let handle = self.flows[flow]?.handle, let code = Self.applicationErrorCode(error) {
+                if let handle = self.flows[flow], let code = Self.applicationErrorCode(error) {
                     self.streamTable?.peerStoppedSending(handle, code: code)
                 }
             case .disconnected(let flow?, let error):
@@ -543,13 +543,15 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     // MARK: Flow events
 
     private func mark(_ flow: StandaloneFlowID, _ events: QUICStreamEvents) {
-        guard let handle = self.flows[flow]?.handle else { return }
+        guard let handle = self.flows[flow] else { return }
         self.streamTable?.markReady(handle: handle, events: events)
     }
 
     /// A locally opened stream got its ID.
     private func flowConnected(_ flowID: StandaloneFlowID) {
-        guard let flow = self.flows[flowID], flow.streamID == nil, let handle = flow.handle else { return }
+        guard let handle = self.flows[flowID], let table = self.streamTable,
+            let flow = table.flow(for: handle), flow.streamID == nil
+        else { return }
         guard let metadata = self.quic.getMetadata(flow: flowID) as ProtocolMetadata<QUICProtocol>?,
             let streamID = metadata.streamID
         else { return }
@@ -567,27 +569,20 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         let quicStreamID = NIOQUICHelpers.QUICStreamID(rawValue: streamID)
         let flow = StandaloneStreamFlow(flowID: flowID)
         flow.streamID = streamID
-        let handle = table.insertSlot(id: quicStreamID, state: nil, flow: flow)
-        flow.handle = handle
-        self.flows.insert(flow)
-        table.assignID(quicStreamID, to: handle)
-        table.markReady(handle: handle, events: [.opened, .readable])
+        let handle = table.insertInboundSlot(id: quicStreamID, flow: flow, events: [.opened, .readable])
+        self.flows.insert(flowID, handle)
     }
 
     private func flowDisconnected(_ flowID: StandaloneFlowID, error: NetworkError?) {
-        guard let flow = self.flows[flowID] else { return }
-        if let handle = flow.handle {
-            self.streamTable?.streamDisconnected(handle, error: error)
-        }
         // The connection releases the flow as it reports the disconnect: nothing to tear down.
-        self.flows.remove(flow.flowID)
-        if !flow.pending.isEmpty { flow.pending.finalizeAllFramesAsFailed() }
+        guard let handle = self.flows.remove(flowID), let table = self.streamTable else { return }
+        table.streamDisconnected(handle, error: error)
+        table.discardPendingFrames(of: handle)
     }
 
     private func release(_ flow: StandaloneStreamFlow) {
-        guard self.flows[flow.flowID] != nil else { return }
-        self.flows.remove(flow.flowID)
-        if !flow.pending.isEmpty { flow.pending.finalizeAllFramesAsFailed() }
+        guard self.flows.remove(flow.flowID) != nil else { return }
+        flow.discardPending()
         self.quic.teardown(flow: flow.flowID)
     }
 
@@ -786,8 +781,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         do throws(NetworkError) {
             let flowID = try self.quic.openStream(unidirectional: !bidirectional)
             let flow = StandaloneStreamFlow(flowID: flowID)
-            flow.handle = handle
-            self.flows.insert(flow)
+            self.flows.insert(flowID, handle)
             self.streamTable?.attachFlow(flow, to: handle)
             self.quic.connect(flow: flowID)
             self.environment.turn()

@@ -23,8 +23,6 @@
 @usableFromInline
 final class StandaloneStreamFlow {
     let flowID: StandaloneFlowID
-    /// The stream's slot in the stream table. Set once the slot exists.
-    var handle: QUICStreamHandle?
     /// The QUIC stream ID, once the stack has assigned it.
     var streamID: UInt64?
     /// Received frames the consumer has not taken yet.
@@ -35,39 +33,54 @@ final class StandaloneStreamFlow {
     init(flowID: StandaloneFlowID) {
         self.flowID = flowID
     }
+
+    /// Lets go of the frames the consumer has not taken.
+    func discardPending() {
+        if !self.pending.isEmpty { self.pending.finalizeAllFramesAsFailed() }
+    }
 }
 
 /// The streams of a connection by flow, for the events that name a flow.
 ///
 /// A flow ID carries the position of the flow's link, which the stack reuses once the flow is
 /// released, so the live flows sit at small positions: this is an array indexed by that position, with
-/// no hashing. The ID itself is checked against the flow found there, so the ID of a released flow
+/// no hashing. The ID itself is checked against the entry found there, so the ID of a released flow
 /// finds nothing, even once a new flow has taken its position.
+///
+/// It holds the stream's handle in the stream table, which owns the flow: finding a stream by flow
+/// takes no reference count.
 @available(anyAppleOS 26, *)
 struct StandaloneFlowWindow {
-    private var items: ContiguousArray<StandaloneStreamFlow?> = []
-
-    subscript(_ id: StandaloneFlowID) -> StandaloneStreamFlow? {
-        let index = id.slotIndex
-        guard index < self.items.count, let flow = self.items[index], flow.flowID == id else { return nil }
-        return flow
+    private struct Entry {
+        var flowID: StandaloneFlowID?
+        var handle: QUICStreamHandle
     }
 
-    mutating func insert(_ flow: StandaloneStreamFlow) {
-        let index = flow.flowID.slotIndex
+    private var items: ContiguousArray<Entry> = []
+
+    subscript(_ id: StandaloneFlowID) -> QUICStreamHandle? {
+        let index = id.slotIndex
+        guard index < self.items.count, self.items[index].flowID == id else { return nil }
+        return self.items[index].handle
+    }
+
+    mutating func insert(_ id: StandaloneFlowID, _ handle: QUICStreamHandle) {
+        let index = id.slotIndex
         while self.items.count <= index {
-            self.items.append(nil)
+            self.items.append(Entry(flowID: nil, handle: handle))
         }
-        self.items[index] = flow
+        self.items[index] = Entry(flowID: id, handle: handle)
     }
 
-    mutating func remove(_ id: StandaloneFlowID) {
+    @discardableResult
+    mutating func remove(_ id: StandaloneFlowID) -> QUICStreamHandle? {
         let index = id.slotIndex
-        guard index < self.items.count, let flow = self.items[index], flow.flowID == id else { return }
-        self.items[index] = nil
+        guard index < self.items.count, self.items[index].flowID == id else { return nil }
+        self.items[index].flowID = nil
+        return self.items[index].handle
     }
 
     var isEmpty: Bool {
-        !self.items.contains { $0 != nil }
+        !self.items.contains { $0.flowID != nil }
     }
 }

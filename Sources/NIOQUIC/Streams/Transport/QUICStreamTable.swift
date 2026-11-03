@@ -302,6 +302,35 @@ extension QUICStreamTable where Consumer: ~Copyable {
         return handle
     }
 
+    /// Makes the slot for a stream the peer opened, whose ID is known: the slot starts out
+    /// connected and ready to be visited with `events`.
+    ///
+    /// This does what `insertSlot(id:state:flow:)`, `assignID(_:to:)` and `markReady(handle:events:)`
+    /// do one after the other for such a stream, with one lookup of the slot and one index update
+    /// in place of three and two.
+    func insertInboundSlot(
+        id: QUICStreamID,
+        flow: consuming StandaloneStreamFlow,
+        events: QUICStreamEvents
+    ) -> QUICStreamHandle {
+        var core = QUICStreamCore(id: id)
+        core.flow = consume flow
+        // A new core is not connected or closed yet, so this is the activation.
+        _ = core.connected(id: id, direction: self.direction(of: id))
+        var transportState = QUICStreamTransportState(core: core)
+        transportState.events = events
+        let handle = self._transportStates.insert(transportState)
+        _ = self._consumerStates.reserve(at: handle.index)
+        self._needsState.append(handle)
+        self._byID[id] = handle
+        self._ready.append(handle)
+        if !self.inReadLoop && !self.outOfBandDrainRequested {
+            self.outOfBandDrainRequested = true
+            self.outOfBandDrain?()
+        }
+        return handle
+    }
+
     /// Registers a fresh identifier for `handle`'s stream, using that stream's own event
     /// manager. Also stashes it as the identifier `ExternalInboundStreamLinkage.identifier` will
     /// report on the very next `BaseInboundStreamLinkage(external: self)` construction — call
@@ -346,6 +375,16 @@ extension QUICStreamTable where Consumer: ~Copyable {
     /// Gives a locally opened stream's slot the driver's state for the stream.
     func attachFlow(_ flow: StandaloneStreamFlow, to handle: QUICStreamHandle) {
         self._transportStates.withValue(for: handle) { $0.core.flow = flow }
+    }
+
+    /// The flow the stream is attached to, if it has one.
+    func flow(for handle: QUICStreamHandle) -> StandaloneStreamFlow? {
+        self._transportStates.pointer(for: handle)?.pointee.core.flow
+    }
+
+    /// Lets go of the frames the stream's flow holds for the consumer.
+    func discardPendingFrames(of handle: QUICStreamHandle) {
+        self._transportStates.pointer(for: handle)?.pointee.core.flow?.discardPending()
     }
 
     /// Records the ID the stack assigned, indexes it, and connects the stream's state machine.
