@@ -109,6 +109,8 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
     private var multiplexerContinuation: MultiplexerContinuation<Consumer>?
     /// The event loop of the channel we are added to.
     private let eventLoop: any EventLoop
+    /// The deadlines of the state machine connections on the loop, and the loop's clock for them.
+    private let timerQueue: QUICTimerQueue
     /// The logger used everywhere.
     private let logger: Logger
     /// The generator used for creating source connection IDs for new connections.
@@ -171,6 +173,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
     ) {
         self.udpChannel = channel
         self.eventLoop = channel.eventLoop
+        self.timerQueue = QUICTimerQueue(eventLoop: channel.eventLoop)
         self.quicConfiguration = quicConfiguration
         self.logger = logger
         self.connectionIDGenerator = connectionIDGenerator
@@ -281,6 +284,7 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
                     localAddress: localAddress,
                     remoteAddress: remoteAddress,
                     eventLoop: self.context!.eventLoop,
+                    timers: self.timerQueue,
                     logger: connectionLogger
                 )
                 channel = self.makeQUICConnectionChannel(stateMachineConnection: connection, handle: handle)
@@ -846,6 +850,7 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
         self.context = nil
         self.connectionRegistry.shutdownConnections(deadline: .now(), promise: nil)
         self.abandonClosingConnections()
+        self.timerQueue.cancelAll()
     }
 
     public func channelInactive(context: ChannelHandlerContext) {
@@ -1033,7 +1038,10 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
     public func channelReadComplete(context: ChannelHandlerContext) {
         self.logger.trace("QUICHandler read complete")
 
+        // The connections that read in this loop see the time it ended, and take the clock once.
+        self.timerQueue.beginBatch()
         self.notifyPendingReadCompletions()
+        self.timerQueue.endBatch()
         self.expectingChannelReadComplete = false
 
         if self.didWrite {
@@ -1113,6 +1121,7 @@ extension QUICHandler: ChannelInboundHandler where Consumer: ~Copyable {
                         localAddress: localAddress,
                         remoteAddress: addressedEnvelope.remoteAddress,
                         eventLoop: self.context!.eventLoop,
+                        timers: self.timerQueue,
                         logger: connectionLogger
                     )
                 )

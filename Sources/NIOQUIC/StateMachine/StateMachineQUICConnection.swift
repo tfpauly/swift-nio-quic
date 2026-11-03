@@ -88,7 +88,7 @@ final class OutputDatagram {
 /// NIO feeds it datagrams and the time, collects the datagrams it queued, drains its events, and
 /// arms one scheduled task for the deadline it asks for.
 @available(anyAppleOS 26, *)
-final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable> {
+final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>: QUICTimerOwner {
     private var quic: StandaloneQUICConnection
     private let environment: StandaloneEnvironment
     let role: Role
@@ -118,8 +118,9 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// Whether the connection was told its outbound data is batched.
     private var batching = false
 
-    private var timer: Scheduled<Void>?
-    private var timerDeadline: NetworkClock.Instant?
+    /// The event loop's timers: the connection has one entry in it for the next time it wants to run.
+    private let timers: QUICTimerQueue
+    var timerQueueIndex = -1
 
     /// The streams, by the flow the stack's events name.
     private var flows = StandaloneFlowWindow()
@@ -177,8 +178,10 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         localAddress: SocketAddress,
         remoteAddress: SocketAddress,
         eventLoop: any EventLoop,
+        timers: QUICTimerQueue,
         logger: Logger
     ) {
+        self.timers = timers
         self.paths = [(remoteAddress, quic.primaryPath)]
         self.quic = quic
         self.environment = environment
@@ -243,6 +246,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         localAddress: SocketAddress,
         remoteAddress: SocketAddress,
         eventLoop: any EventLoop,
+        timers: QUICTimerQueue? = nil,
         logger: Logger
     ) throws -> StateMachineQUICConnection<Consumer> {
         guard let serverName else {
@@ -264,6 +268,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             localAddress: localAddress,
             remoteAddress: remoteAddress,
             eventLoop: eventLoop,
+            timers: timers,
             logger: logger
         )
     }
@@ -278,6 +283,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         localAddress: SocketAddress,
         remoteAddress: SocketAddress,
         eventLoop: any EventLoop,
+        timers: QUICTimerQueue? = nil,
         logger: Logger
     ) throws -> StateMachineQUICConnection<Consumer> {
         guard let serverName = configuration.serverName else {
@@ -300,6 +306,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             localAddress: localAddress,
             remoteAddress: remoteAddress,
             eventLoop: eventLoop,
+            timers: timers,
             logger: logger
         )
     }
@@ -311,6 +318,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         localAddress: SocketAddress,
         remoteAddress: SocketAddress,
         eventLoop: any EventLoop,
+        timers: QUICTimerQueue? = nil,
         logger: Logger
     ) throws -> StateMachineQUICConnection<Consumer> {
         let environment = StandaloneEnvironment(
@@ -339,6 +347,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             localAddress: localAddress,
             remoteAddress: remoteAddress,
             eventLoop: eventLoop,
+            timers: timers ?? QUICTimerQueue(eventLoop: eventLoop),
             logger: logger
         )
         connection.makeStreamTable(configuration: configuration)
@@ -419,7 +428,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     }
 
     func receivePacketsComplete() {
-        self.environment.scheduler.advance(to: Self.now)
+        self.environment.scheduler.advance(to: self.timers.now)
         // Hand the connection the whole read loop's datagrams at once, per path.
         var batch = FrameArray(capacity: max(self.inbound.count, 1))
         var batchPath: StandalonePathID?
@@ -481,7 +490,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     /// Runs the timers that are due, delivers the connection's events and re-arms the timer.
     private func afterUpdate() {
-        self.environment.turn(now: Self.now)
+        self.environment.turn(now: self.timers.now)
         self.processEvents()
         if !self.inReadLoop {
             if let channelView = self.channelView {
@@ -590,9 +599,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     /// The connection reported its disconnect: nothing is left to drive, and it can be released.
     private func connectionClosed(error: NetworkError?) {
-        self.timer?.cancel()
-        self.timer = nil
-        self.timerDeadline = nil
+        self.timers.remove(self)
         self.isClosed = true
         self.logger.debug("Connection closed", metadata: ["quic.close.error": "\(String(describing: error))"])
         self.reportClose(error: error)
@@ -625,21 +632,12 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     private func rescheduleTimer() {
         guard let deadline = self.environment.nextTimerDeadline else { return }
-        // Rescheduling a NIO task is expensive. Keep an armed timer that fires no later than
-        // needed: if it fires early, `timerFired` re-arms it for the real deadline.
-        if let current = self.timerDeadline, self.timer != nil, current <= deadline {
-            return
-        }
-        self.timer?.cancel()
-        self.timerDeadline = deadline
-        self.timer = self.eventLoop.assumeIsolated().scheduleTask(deadline: Self.deadline(for: deadline)) {
-            self.timerFired()
-        }
+        // The queue keeps an earlier deadline of this connection's: it fires early if need be, and
+        // `timerDue` arms the real one then.
+        self.timers.arm(self, deadline: Self.deadline(for: deadline))
     }
 
-    private func timerFired() {
-        self.timer = nil
-        self.timerDeadline = nil
+    func timerDue() {
         self.afterUpdate()
     }
 
@@ -655,7 +653,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     func drainPacketsToSend(to transport: some QUICTransport) {
         self.drainScheduled = false
-        self.environment.scheduler.advance(to: Self.now)
+        self.environment.scheduler.advance(to: self.timers.now)
         self.environment.turn()
         self.processEvents()
         for index in self.paths.indices {
@@ -695,7 +693,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         } else {
             error = nil
         }
-        self.environment.scheduler.advance(to: Self.now)
+        self.environment.scheduler.advance(to: self.timers.now)
         self.quic.disconnect(error: error)
         self.environment.turn()
         self.processEvents()
@@ -732,9 +730,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             // The connection still closes or drains (RFC 9000 Section 10.2): keep its timer, which
             // holds the connection until it reports its disconnect.
         } else {
-            self.timer?.cancel()
-            self.timer = nil
-            self.timerDeadline = nil
+            self.timers.remove(self)
         }
         self.environment.scheduler.onWorkAvailable = nil
         self.workTarget?.connection = nil
@@ -758,7 +754,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     func receiveWhileClosing(_ envelope: AddressedEnvelope<ByteBuffer>) {
         guard self.closingTransport != nil else { return }
         var datagram = envelope.data
-        self.environment.scheduler.advance(to: Self.now)
+        self.environment.scheduler.advance(to: self.timers.now)
         var frames = FrameArray(capacity: 1)
         Self.append(&datagram, to: &frames)
         self.quic.receiveFromBelow(path: self.quic.primaryPath, frames)
@@ -767,9 +763,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     /// Stops driving a connection whose channel went away: the handler is going away.
     func abandonClosing() {
-        self.timer?.cancel()
-        self.timer = nil
-        self.timerDeadline = nil
+        self.timers.remove(self)
         self.closingTransport = nil
         self.onClosedWithoutChannel = nil
     }
