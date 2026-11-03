@@ -122,6 +122,8 @@ public final class QUICHandler<Consumer: QUICStreamConsumer & ~Copyable> {
     private var state: State = .accepting
     /// Boolean to indicate if we wrote something.
     private var didWrite = false
+    /// Whether a flush is already queued for the end of the event loop's current pass.
+    private var flushQueued = false
     /// Whether we're expecting a channelReadComplete. This is used to delay flushing the channel until the a read complete is received.
     private var expectingChannelReadComplete: Bool = false
     /// Connections which read at least one datagram in the read loop.
@@ -1334,6 +1336,18 @@ extension QUICHandler where Consumer: ~Copyable {
         }
     }
 
+    /// As ``flush()``, for output a connection makes outside a read loop (a timer, a write from the
+    /// application): the flush waits for the rest of the event loop's pass instead of making a
+    /// system call of its own, so connections whose output is made together share one flush.
+    internal func flushCoalesced() {
+        guard self.didWrite && !self.expectingChannelReadComplete, !self.flushQueued else { return }
+        self.flushQueued = true
+        self.eventLoop.assumeIsolated().execute {
+            self.flushQueued = false
+            self.flush()
+        }
+    }
+
     internal func read() {
         self.logger.trace("QUICHandler read from child channel")
         self.context?.read()
@@ -1358,7 +1372,7 @@ extension QUICHandler where Consumer: ~Copyable {
         }
 
         func flush() {
-            self.handler.flush()
+            self.handler.flushCoalesced()
         }
 
         func read() {
