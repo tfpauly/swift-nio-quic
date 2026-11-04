@@ -38,14 +38,18 @@ import Musl
 @available(anyAppleOS 26, *)
 final class OutputArena {
     /// The arena's size. A datagram's frame is at most one packet, so an arena holds dozens.
-    static var capacity: Int { 64 * 1024 }
+    static var capacity: Int { 16 * 1024 }
 
     private(set) var buffer: ByteBuffer
     private let base: UnsafeMutableRawPointer
     private var used = 0
+    /// Where the latest frame carved starts, which is the only one whose unused end can be given back.
+    private var lastCarveStart = -1
 
-    init(buffer: ByteBuffer) {
-        var buffer = buffer
+    init(allocator: ByteBufferAllocator, capacity requested: Int) {
+        // Made here, not handed in: a buffer the caller still holds is not unique, and marking it
+        // in use would copy all of it.
+        var buffer = allocator.buffer(capacity: requested)
         let capacity = buffer.capacity
         // Mark the whole capacity as in use: the frames wrap it, and each packet's offset and length
         // are set when its datagram is taken back.
@@ -58,14 +62,24 @@ final class OutputArena {
     func carve(_ size: Int) -> UnsafeMutableRawBufferPointer? {
         let start = (self.used + 15) & ~15
         guard start + size <= self.buffer.capacity else { return nil }
+        self.lastCarveStart = start
         self.used = start + size
         return UnsafeMutableRawBufferPointer(start: self.base + start, count: size)
     }
 
     /// The datagram a finished frame holds, as a slice of the arena, if the frame was carved from it.
-    func slice(starting pointer: UnsafeRawPointer, length: Int) -> ByteBuffer? {
+    ///
+    /// `region` is the whole of what the frame was carved. A packet seldom fills it (an
+    /// acknowledgement uses a few dozen bytes), so if it is the latest carve, what is past the packet
+    /// goes back to the arena for the next frame: datagrams then sit close together in memory that
+    /// is reused soon, which a buffer of its own per datagram used to give.
+    func slice(starting pointer: UnsafeRawPointer, length: Int, in region: UnsafeRawPointer) -> ByteBuffer? {
         let offset = pointer - UnsafeRawPointer(self.base)
         guard offset >= 0, offset + length <= self.buffer.capacity else { return nil }
+        let regionStart = region - UnsafeRawPointer(self.base)
+        if regionStart == self.lastCarveStart {
+            self.used = offset + length
+        }
         return self.buffer.getSlice(at: offset, length: length)
     }
 }
@@ -85,7 +99,7 @@ final class OutputDatagram {
         if let arena = self.arena, let region = arena.carve(size) {
             return Frame(customBuffer: region, owner: arena)
         }
-        let arena = OutputArena(buffer: self.allocator.buffer(capacity: max(OutputArena.capacity, size)))
+        let arena = OutputArena(allocator: self.allocator, capacity: max(OutputArena.capacity, size))
         self.arena = arena
         // A new arena always has room for one frame.
         return Frame(customBuffer: arena.carve(size)!, owner: arena)
@@ -97,16 +111,18 @@ final class OutputDatagram {
         guard length > 0 else { return nil }
         // The owner is an arena when the frame is one of ours, which its class says.
         var arena: OutputArena?
+        var region: UnsafeRawPointer?
         switch frame.buffer {
-        case .customOwner(_, let owner):
+        case .customOwner(let pointer, let owner):
             if ObjectIdentifier(type(of: owner)) == ObjectIdentifier(OutputArena.self) {
                 arena = unsafeDowncast(owner, to: OutputArena.self)
+                region = pointer.baseAddress.map { UnsafeRawPointer($0) }
             }
         default:
             break
         }
-        if let arena, let start = frame.span?.withUnsafeBufferPointer({ UnsafeRawPointer($0.baseAddress) }),
-            let datagram = arena.slice(starting: start, length: length)
+        if let arena, let region, let start = frame.span?.withUnsafeBufferPointer({ UnsafeRawPointer($0.baseAddress) }),
+            let datagram = arena.slice(starting: start, length: length, in: region)
         {
             return datagram
         }
