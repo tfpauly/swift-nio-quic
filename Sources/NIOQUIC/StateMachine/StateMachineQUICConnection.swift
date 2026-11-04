@@ -27,53 +27,88 @@ import Glibc
 import Musl
 #endif
 
-/// A datagram's buffer, which the connection builds its packet in.
+/// A buffer the connection builds datagrams in, many to a buffer.
 ///
-/// The standalone protocol asks the driver for the frames it builds datagrams in. Each is a
-/// `ByteBuffer` the driver hands out (wrapped by a `Frame`, which owns this box), and the finished
-/// datagram goes to NIO as that same buffer, with the packet's offset and length.
+/// The standalone protocol asks the driver for the frames it builds datagrams in. Each frame is a
+/// slice of an arena: a `ByteBuffer` the size of many datagrams, carved up as frames are asked for.
+/// The frame owns the arena, and the finished datagram goes to NIO as a slice of the same storage,
+/// with the packet's offset and length. A datagram used to be a `ByteBuffer` and a box of its own,
+/// two allocations for every datagram, an acknowledgement's included, which uses a few dozen bytes
+/// of the room it was given.
 @available(anyAppleOS 26, *)
-final class OutputDatagram {
-    var buffer: ByteBuffer
+final class OutputArena {
+    /// The arena's size. A datagram's frame is at most one packet, so an arena holds dozens.
+    static var capacity: Int { 64 * 1024 }
+
+    private(set) var buffer: ByteBuffer
+    private let base: UnsafeMutableRawPointer
+    private var used = 0
 
     init(buffer: ByteBuffer) {
+        var buffer = buffer
+        let capacity = buffer.capacity
+        // Mark the whole capacity as in use: the frames wrap it, and each packet's offset and length
+        // are set when its datagram is taken back.
+        buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: capacity) { _ in capacity }
+        self.base = buffer.withUnsafeMutableReadableBytes { $0.baseAddress! }
         self.buffer = buffer
     }
 
-    /// A frame over `size` bytes of a new buffer.
-    static func makeFrame(size: Int, allocator: ByteBufferAllocator) -> Frame {
-        var buffer = allocator.buffer(capacity: size)
-        // Mark the whole capacity as in use: the frame wraps all of it, and the packet's offset and
-        // length are set when the datagram is taken back.
-        buffer.writeWithUnsafeMutableBytes(minimumWritableBytes: size) { _ in size }
-        let box = OutputDatagram(buffer: buffer)
-        let pointer = box.buffer.withUnsafeMutableReadableBytes { $0 }
-        return Frame(customBuffer: pointer, owner: box)
+    /// Room for `size` more bytes, if the arena has it.
+    func carve(_ size: Int) -> UnsafeMutableRawBufferPointer? {
+        let start = (self.used + 15) & ~15
+        guard start + size <= self.buffer.capacity else { return nil }
+        self.used = start + size
+        return UnsafeMutableRawBufferPointer(start: self.base + start, count: size)
+    }
+
+    /// The datagram a finished frame holds, as a slice of the arena, if the frame was carved from it.
+    func slice(starting pointer: UnsafeRawPointer, length: Int) -> ByteBuffer? {
+        let offset = pointer - UnsafeRawPointer(self.base)
+        guard offset >= 0, offset + length <= self.buffer.capacity else { return nil }
+        return self.buffer.getSlice(at: offset, length: length)
+    }
+}
+
+/// Hands out the frames a connection builds its datagrams in, and takes the datagrams back.
+@available(anyAppleOS 26, *)
+final class OutputDatagram {
+    private let allocator: ByteBufferAllocator
+    private var arena: OutputArena?
+
+    init(allocator: ByteBufferAllocator) {
+        self.allocator = allocator
+    }
+
+    /// A frame over `size` bytes of the current arena, starting a new arena when it is full.
+    func makeFrame(size: Int) -> Frame {
+        if let arena = self.arena, let region = arena.carve(size) {
+            return Frame(customBuffer: region, owner: arena)
+        }
+        let arena = OutputArena(buffer: self.allocator.buffer(capacity: max(OutputArena.capacity, size)))
+        self.arena = arena
+        // A new arena always has room for one frame.
+        return Frame(customBuffer: arena.carve(size)!, owner: arena)
     }
 
     /// Takes the datagram out of a finished frame, without copying it if the frame is one of ours.
     static func datagram(from frame: borrowing Frame, allocator: ByteBufferAllocator) -> ByteBuffer? {
         let length = frame.unclaimedLength
         guard length > 0 else { return nil }
-        var base: UnsafeMutableRawPointer?
-        var owned: OutputDatagram?
+        // The owner is an arena when the frame is one of ours, which its class says.
+        var arena: OutputArena?
         switch frame.buffer {
-        case .customOwner(let pointer, let owner):
-            base = pointer.baseAddress
-            // The owner is the box this file made when the frame is one of ours, which its class says.
-            if ObjectIdentifier(type(of: owner)) == ObjectIdentifier(OutputDatagram.self) {
-                owned = unsafeDowncast(owner, to: OutputDatagram.self)
+        case .customOwner(_, let owner):
+            if ObjectIdentifier(type(of: owner)) == ObjectIdentifier(OutputArena.self) {
+                arena = unsafeDowncast(owner, to: OutputArena.self)
             }
         default:
             break
         }
-        if let owned, let base,
-            let start = frame.span?.withUnsafeBufferPointer({ UnsafeRawPointer($0.baseAddress) })
+        if let arena, let start = frame.span?.withUnsafeBufferPointer({ UnsafeRawPointer($0.baseAddress) }),
+            let datagram = arena.slice(starting: start, length: length)
         {
-            let offset = start - UnsafeRawPointer(base)
-            owned.buffer.moveReaderIndex(to: offset)
-            owned.buffer.moveWriterIndex(to: offset + length)
-            return owned.buffer
+            return datagram
         }
         var buffer = allocator.buffer(capacity: length)
         frame.span?.withUnsafeBufferPointer { _ = buffer.writeBytes($0) }
@@ -105,8 +140,15 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// The stream table the consumer works on.
     private(set) var streamTable: QUICStreamTable<Consumer>?
 
+    /// A datagram received in the current read loop, with the path it arrived on. The address it
+    /// came from is looked up once, as it arrives, and not carried with the datagram.
+    private struct InboundDatagram {
+        var path: StandalonePathID
+        var data: ByteBuffer
+    }
+
     /// Datagrams received in the current read loop, processed on `receivePacketsComplete`.
-    private var inbound: Deque<AddressedEnvelope<ByteBuffer>> = []
+    private var inbound: Deque<InboundDatagram> = []
 
     /// The paths a server knows, by the client address they lead to, in the order they were added;
     /// the handshake's path first. A client only has the one to the server.
@@ -326,10 +368,10 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             now: Self.now
         )
         let packetSize = max(configuration.initialPacketSize.size(forClientInitial: nil), 1200)
-        let outputAllocator = ByteBufferAllocator()
+        let outputFrames = OutputDatagram(allocator: ByteBufferAllocator())
         environment.maximumOutputSize = packetSize
         environment.setOutputFrameProvider { size in
-            OutputDatagram.makeFrame(size: size, allocator: outputAllocator)
+            outputFrames.makeFrame(size: size)
         }
         let quic = try StandaloneQUICConnection(
             options: options,
@@ -423,7 +465,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
             self.streamTable?.inReadLoop = true
             self.setBatching(true)
         }
-        self.inbound.append(envelope)
+        let path = self.path(for: envelope.remoteAddress)
+        self.inbound.append(InboundDatagram(path: path, data: envelope.data))
         return envelope.data.readableBytes
     }
 
@@ -432,13 +475,13 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         // Hand the connection the whole read loop's datagrams at once, per path.
         var batch = FrameArray(capacity: max(self.inbound.count, 1))
         var batchPath: StandalonePathID?
-        while var envelope = self.inbound.popFirst() {
-            let path = self.path(for: envelope.remoteAddress)
+        while var datagram = self.inbound.popFirst() {
+            let path = datagram.path
             if let current = batchPath, current != path {
                 self.quic.receiveFromBelow(path: current, batch.drainArray())
             }
             batchPath = path
-            Self.append(&envelope.data, to: &batch)
+            Self.append(&datagram.data, to: &batch)
         }
         if let path = batchPath, !batch.isEmpty {
             self.quic.receiveFromBelow(path: path, batch.drainArray())
