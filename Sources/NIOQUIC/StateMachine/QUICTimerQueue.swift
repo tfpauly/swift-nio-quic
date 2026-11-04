@@ -16,12 +16,26 @@ import NIOCore
 
 @_spi(Essentials) @_spi(ProtocolProvider) import SwiftNetwork
 
+/// Where an owner is in its queue's heap, or `-1` if it has no deadline queued.
+///
+/// The heap moves entries around and keeps every owner's index current. Writing the index through
+/// the owner's protocol makes the compiler retain and release the owner around each write, as the
+/// write could run any code; a final class with one stored property has no such cost.
+@available(anyAppleOS 26, *)
+final class QUICTimerSlot {
+    var index = -1
+}
+
+@available(anyAppleOS 26, *)
+extension QUICTimerOwner {
+    var timerQueueIndex: Int { self.timerSlot.index }
+}
+
 /// Something that has a deadline in a ``QUICTimerQueue``.
 @available(anyAppleOS 26, *)
 protocol QUICTimerOwner: AnyObject {
-    /// Where the owner is in the queue's heap, or `-1` if it has no deadline queued. Only the queue
-    /// sets it.
-    var timerQueueIndex: Int { get set }
+    /// Where the owner is in the queue's heap. Only the queue sets it.
+    var timerSlot: QUICTimerSlot { get }
 
     /// The owner's deadline has passed.
     func timerDue()
@@ -47,6 +61,7 @@ final class QUICTimerQueue {
     private struct Entry {
         var deadline: NIODeadline
         var owner: any QUICTimerOwner
+        let slot: QUICTimerSlot
     }
 
     private var heap: [Entry] = []
@@ -90,14 +105,14 @@ final class QUICTimerQueue {
     /// Makes sure `owner` is called no later than `deadline`. An earlier deadline of the owner's
     /// stays: it fires early if need be, and the owner arms the real one then.
     func arm(_ owner: some QUICTimerOwner, deadline: NIODeadline) {
-        let index = owner.timerQueueIndex
+        let index = owner.timerSlot.index
         if index >= 0 {
             guard deadline < self.heap[index].deadline else { return }
             self.heap[index].deadline = deadline
             self.siftUp(index)
         } else {
-            self.heap.append(Entry(deadline: deadline, owner: owner))
-            owner.timerQueueIndex = self.heap.count - 1
+            self.heap.append(Entry(deadline: deadline, owner: owner, slot: owner.timerSlot))
+            owner.timerSlot.index = self.heap.count - 1
             self.siftUp(self.heap.count - 1)
         }
         self.armTask()
@@ -105,7 +120,7 @@ final class QUICTimerQueue {
 
     /// Drops `owner`'s deadline, if it has one.
     func remove(_ owner: some QUICTimerOwner) {
-        let index = owner.timerQueueIndex
+        let index = owner.timerSlot.index
         guard index >= 0 else { return }
         self.removeEntry(at: index)
     }
@@ -115,7 +130,7 @@ final class QUICTimerQueue {
         self.task?.cancel()
         self.task = nil
         self.taskDeadline = nil
-        for entry in self.heap { entry.owner.timerQueueIndex = -1 }
+        for entry in self.heap { entry.slot.index = -1 }
         self.heap.removeAll()
     }
 
@@ -158,14 +173,14 @@ final class QUICTimerQueue {
 
     private func removeEntry(at index: Int) {
         let last = self.heap.count - 1
-        self.heap[index].owner.timerQueueIndex = -1
+        self.heap[index].slot.index = -1
         if index == last {
             self.heap.removeLast()
             return
         }
         self.heap.swapAt(index, last)
         self.heap.removeLast()
-        self.heap[index].owner.timerQueueIndex = index
+        self.heap[index].slot.index = index
         self.siftDown(index)
         self.siftUp(index)
     }
@@ -196,7 +211,7 @@ final class QUICTimerQueue {
 
     private func swap(_ a: Int, _ b: Int) {
         self.heap.swapAt(a, b)
-        self.heap[a].owner.timerQueueIndex = a
-        self.heap[b].owner.timerQueueIndex = b
+        self.heap[a].slot.index = a
+        self.heap[b].slot.index = b
     }
 }

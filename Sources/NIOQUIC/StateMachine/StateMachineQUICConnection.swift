@@ -178,7 +178,7 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
 
     /// The event loop's timers: the connection has one entry in it for the next time it wants to run.
     private let timers: QUICTimerQueue
-    var timerQueueIndex = -1
+    let timerSlot = QUICTimerSlot()
 
     /// The streams, by the flow the stack's events name.
     private var flows = StandaloneFlowWindow()

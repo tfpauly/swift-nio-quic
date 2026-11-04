@@ -21,7 +21,7 @@ import Testing
 struct QUICTimerQueueTests {
     @available(anyAppleOS 26, *)
     private final class Owner: QUICTimerOwner {
-        var timerQueueIndex = -1
+        let timerSlot = QUICTimerSlot()
         var fired: [String] = []
         let name: String
         let log: Log
