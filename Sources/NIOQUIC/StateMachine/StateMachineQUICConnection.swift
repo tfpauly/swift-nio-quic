@@ -132,6 +132,18 @@ final class OutputDatagram {
     }
 }
 
+/// A datagram received in the current read loop, with the path it arrived on. The address it
+/// came from is looked up once, as it arrives, and not carried with the datagram.
+///
+/// It is declared outside the connection, which is generic over its consumer: inside, the queue of
+/// these would depend on the consumer too, and every append and pop would look its type up at run
+/// time.
+@available(anyAppleOS 26, *)
+private struct InboundDatagram {
+    var path: StandalonePathID
+    var data: ByteBuffer
+}
+
 /// A QUIC connection driven directly from NIO through SwiftNetwork's `StandaloneQUICConnection`:
 /// a protocol that owns its own event context, with no linkages, no call-out queue and no
 /// scheduler for NIO to implement.
@@ -156,15 +168,8 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
     /// The stream table the consumer works on.
     private(set) var streamTable: QUICStreamTable<Consumer>?
 
-    /// A datagram received in the current read loop, with the path it arrived on. The address it
-    /// came from is looked up once, as it arrives, and not carried with the datagram.
-    private struct InboundDatagram {
-        var path: StandalonePathID
-        var data: ByteBuffer
-    }
-
     /// Datagrams received in the current read loop, processed on `receivePacketsComplete`.
-    private var inbound: Deque<InboundDatagram> = []
+    private var inbound: [InboundDatagram] = []
 
     /// The paths a server knows, by the client address they lead to, in the order they were added;
     /// the handshake's path first. A client only has the one to the server.
@@ -491,14 +496,15 @@ final class StateMachineQUICConnection<Consumer: QUICStreamConsumer & ~Copyable>
         // Hand the connection the whole read loop's datagrams at once, per path.
         var batch = FrameArray(capacity: max(self.inbound.count, 1))
         var batchPath: StandalonePathID?
-        while var datagram = self.inbound.popFirst() {
-            let path = datagram.path
+        for index in self.inbound.indices {
+            let path = self.inbound[index].path
             if let current = batchPath, current != path {
                 self.quic.receiveFromBelow(path: current, batch.drainArray())
             }
             batchPath = path
-            Self.append(&datagram.data, to: &batch)
+            Self.append(&self.inbound[index].data, to: &batch)
         }
+        self.inbound.removeAll(keepingCapacity: true)
         if let path = batchPath, !batch.isEmpty {
             self.quic.receiveFromBelow(path: path, batch.drainArray())
         }
